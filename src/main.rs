@@ -22,7 +22,7 @@ use config::Config;
 use domain::errors::ErrorSource;
 use futures_util::stream::StreamExt;
 use interfaces::error_response;
-use models::{AnthropicRequest, OpenAIStreamResponse};
+use models::AnthropicRequest;
 use reqwest::Client;
 use serde_json::json;
 use std::{
@@ -335,8 +335,19 @@ async fn forward_non_stream(
             .into_response();
         }
     };
-    let anthropic_response =
-        openai_to_anthropic::format_openai_to_anthropic(openai_response.clone());
+    let anthropic_response = match openai_to_anthropic::format_openai_to_anthropic(openai_response)
+    {
+        Ok(response) => response,
+        Err(error) => {
+            return error_response(
+                StatusCode::BAD_GATEWAY,
+                ErrorSource::Upstream,
+                format!("Upstream response translation failed: {error}"),
+                request_id,
+            )
+            .into_response();
+        }
+    };
 
     if let Ok(response_json) = serde_json::to_string_pretty(&anthropic_response) {
         log_payload(logging_path, "response", &response_json);
@@ -406,12 +417,13 @@ fn forward_stream(
         let mut byte_stream = res.bytes_stream();
         let mut buffer = String::new();
         let mut content_block_open = false;
-        let block_index: u32 = 0;
+        let mut tool_block_open = false;
+        let mut block_index: u32 = 0;
         let mut final_stop_reason: Option<String> = None;
 
         while let Some(item) = byte_stream.next().await {
             let Ok(chunk) = item else {
-                if content_block_open {
+                if content_block_open || tool_block_open {
                     let content_block_stop = json!({
                         "type": "content_block_stop",
                         "index": block_index
@@ -443,10 +455,10 @@ fn forward_stream(
                     if data == "[DONE]" {
                         break;
                     }
-                    let stream_res = match serde_json::from_str::<OpenAIStreamResponse>(data) {
+                    let parsed_chunk = match parse_openai_stream_chunk(data) {
                         Ok(parsed) => parsed,
                         Err(_) => {
-                            if content_block_open {
+                            if content_block_open || tool_block_open {
                                 let content_block_stop = json!({
                                     "type": "content_block_stop",
                                     "index": block_index
@@ -464,8 +476,68 @@ fn forward_stream(
                         }
                     };
 
-                    if let Some(choice) = stream_res.choices.first() {
-                        if let Some(content) = &choice.delta.content {
+                    if let Some(chunk_data) = parsed_chunk {
+                        // Handle tool call deltas
+                        for tc in &chunk_data.tool_calls {
+                            if tc.id.is_some() || tc.name.is_some() {
+                                // New tool call — close any open block first
+                                if content_block_open {
+                                    let stop = json!({"type": "content_block_stop", "index": block_index});
+                                    let sse_event = format!("event: content_block_stop\ndata: {stop}\n\n");
+                                    yield Ok::<_, axum::Error>(sse_event.into_bytes());
+                                    block_index += 1;
+                                    content_block_open = false;
+                                }
+                                if tool_block_open {
+                                    let stop = json!({"type": "content_block_stop", "index": block_index});
+                                    let sse_event = format!("event: content_block_stop\ndata: {stop}\n\n");
+                                    yield Ok::<_, axum::Error>(sse_event.into_bytes());
+                                    block_index += 1;
+                                }
+
+                                let start = json!({
+                                    "type": "content_block_start",
+                                    "index": block_index,
+                                    "content_block": {
+                                        "type": "tool_use",
+                                        "id": tc.id.as_deref().unwrap_or(""),
+                                        "name": tc.name.as_deref().unwrap_or(""),
+                                        "input": {}
+                                    }
+                                });
+                                let sse_event = format!("event: content_block_start\ndata: {start}\n\n");
+                                yield Ok::<_, axum::Error>(sse_event.into_bytes());
+                                tool_block_open = true;
+                            }
+
+                            if let Some(args) = &tc.arguments
+                                && !args.is_empty()
+                                && tool_block_open
+                            {
+                                let delta = json!({
+                                    "type": "content_block_delta",
+                                    "index": block_index,
+                                    "delta": {
+                                        "type": "input_json_delta",
+                                        "partial_json": args
+                                    }
+                                });
+                                let sse_event = format!("event: content_block_delta\ndata: {delta}\n\n");
+                                yield Ok::<_, axum::Error>(sse_event.into_bytes());
+                            }
+                        }
+
+                        // Handle text content
+                        if let Some(content) = chunk_data.content {
+                            // Close tool block if switching to text
+                            if tool_block_open {
+                                let stop = json!({"type": "content_block_stop", "index": block_index});
+                                let sse_event = format!("event: content_block_stop\ndata: {stop}\n\n");
+                                yield Ok::<_, axum::Error>(sse_event.into_bytes());
+                                block_index += 1;
+                                tool_block_open = false;
+                            }
+
                             if !content_block_open {
                                 let content_block_start = json!({
                                     "type": "content_block_start",
@@ -492,17 +564,17 @@ fn forward_stream(
                             yield Ok::<_, axum::Error>(sse_event.into_bytes());
                         }
 
-                        if let Some(reason) = &choice.finish_reason
+                        if let Some(reason) = chunk_data.finish_reason
                             && !reason.is_empty()
                         {
-                            final_stop_reason = Some(map_stop_reason(reason).to_string());
+                            final_stop_reason = Some(map_stop_reason(&reason).to_string());
                         }
                     }
                 }
             }
         }
 
-        if content_block_open {
+        if content_block_open || tool_block_open {
             let content_block_stop = json!({
                 "type": "content_block_stop",
                 "index": block_index
@@ -678,6 +750,67 @@ fn stream_error_event(source: ErrorSource, message: &str, request_id: &str) -> S
     format!("event: error\ndata: {payload}\n\n")
 }
 
+struct ToolCallDelta {
+    id: Option<String>,
+    name: Option<String>,
+    arguments: Option<String>,
+}
+
+struct ParsedChunk {
+    content: Option<String>,
+    tool_calls: Vec<ToolCallDelta>,
+    finish_reason: Option<String>,
+}
+
+fn parse_openai_stream_chunk(data: &str) -> Result<Option<ParsedChunk>, ()> {
+    let value: serde_json::Value = serde_json::from_str(data).map_err(|_| ())?;
+    let Some(choices) = value.get("choices").and_then(serde_json::Value::as_array) else {
+        return Ok(None);
+    };
+    let Some(choice) = choices.first() else {
+        return Ok(None);
+    };
+
+    let content = choice
+        .get("delta")
+        .and_then(|delta| delta.get("content"))
+        .and_then(serde_json::Value::as_str)
+        .map(ToString::to_string);
+    let finish_reason = choice
+        .get("finish_reason")
+        .and_then(serde_json::Value::as_str)
+        .map(ToString::to_string);
+
+    let mut tool_calls = Vec::new();
+    if let Some(tc_array) = choice
+        .get("delta")
+        .and_then(|d| d.get("tool_calls"))
+        .and_then(serde_json::Value::as_array)
+    {
+        for tc in tc_array {
+            tool_calls.push(ToolCallDelta {
+                id: tc.get("id").and_then(|v| v.as_str()).map(String::from),
+                name: tc
+                    .get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
+                arguments: tc
+                    .get("function")
+                    .and_then(|f| f.get("arguments"))
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
+            });
+        }
+    }
+
+    Ok(Some(ParsedChunk {
+        content,
+        tool_calls,
+        finish_reason,
+    }))
+}
+
 fn map_stop_reason(finish_reason: &str) -> &str {
     match finish_reason {
         "tool_calls" => "tool_use",
@@ -689,7 +822,8 @@ fn map_stop_reason(finish_reason: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppState, build_router, next_request_id, redact_sensitive_headers, resolve_stream_mode,
+        AppState, build_router, next_request_id, parse_openai_stream_chunk,
+        redact_sensitive_headers, resolve_stream_mode,
     };
     use crate::config::Config;
     use axum::{
@@ -781,6 +915,39 @@ mod tests {
     #[test]
     fn stream_mode_uses_explicit_false_flag() {
         assert!(!resolve_stream_mode(Some(false)));
+    }
+
+    #[test]
+    fn parse_openai_stream_chunk_ignores_non_choice_payloads() {
+        let parsed =
+            parse_openai_stream_chunk(r#"{"type":"ping"}"#).expect("payload should be valid json");
+        assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn parse_openai_stream_chunk_extracts_content_and_finish_reason() {
+        let parsed = parse_openai_stream_chunk(
+            r#"{"id":"s","model":"m","choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":"tool_calls"}]}"#,
+        )
+        .expect("payload should parse")
+        .expect("choice payload should be extracted");
+        assert_eq!(parsed.content.as_deref(), Some("hi"));
+        assert_eq!(parsed.finish_reason.as_deref(), Some("tool_calls"));
+        assert!(parsed.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn parse_openai_stream_chunk_extracts_tool_call_deltas() {
+        let parsed = parse_openai_stream_chunk(
+            r#"{"id":"s","model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{}"}}]},"finish_reason":null}]}"#,
+        )
+        .expect("payload should parse")
+        .expect("choice payload should be extracted");
+        assert!(parsed.content.is_none());
+        assert_eq!(parsed.tool_calls.len(), 1);
+        assert_eq!(parsed.tool_calls[0].id.as_deref(), Some("call_1"));
+        assert_eq!(parsed.tool_calls[0].name.as_deref(), Some("lookup"));
+        assert_eq!(parsed.tool_calls[0].arguments.as_deref(), Some("{}"));
     }
 
     enum ApiKeyMode {
@@ -1261,6 +1428,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn messages_malformed_tool_definition_returns_local_validation_error() {
+        let app = build_router(test_state());
+        let payload = r#"{
+            "model":"claude-sonnet-4",
+            "messages":[{"role":"user","content":"Hello"}],
+            "tools":[{"description":"missing name","input_schema":{"type":"object"}}]
+        }"#;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("content-type", "application/json")
+                    .header("x-api-key", "dummy")
+                    .body(Body::from(payload))
+                    .expect("request build should succeed"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = parse_json_body(response).await;
+        let error = body
+            .get("error")
+            .and_then(Value::as_object)
+            .expect("error envelope should exist");
+        assert_eq!(
+            error.get("source").and_then(Value::as_str),
+            Some("local_validation")
+        );
+        assert_eq!(
+            error.get("message").and_then(Value::as_str),
+            Some("Invalid Anthropic payload: Invalid tool definition: missing name")
+        );
+    }
+
+    #[tokio::test]
+    async fn messages_unknown_tool_result_id_returns_local_validation_error() {
+        let app = build_router(test_state());
+        let payload = r#"{
+            "model":"claude-sonnet-4",
+            "messages":[
+                {"role":"user","content":[{"type":"tool_result","tool_use_id":"missing","content":{"ok":true}}]}
+            ]
+        }"#;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("content-type", "application/json")
+                    .header("x-api-key", "dummy")
+                    .body(Body::from(payload))
+                    .expect("request build should succeed"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = parse_json_body(response).await;
+        let error = body
+            .get("error")
+            .and_then(Value::as_object)
+            .expect("error envelope should exist");
+        assert_eq!(
+            error.get("source").and_then(Value::as_str),
+            Some("local_validation")
+        );
+        assert_eq!(
+            error.get("message").and_then(Value::as_str),
+            Some(
+                "Invalid Anthropic payload: Invalid tool_result block: unknown tool_use_id missing"
+            )
+        );
+    }
+
+    #[tokio::test]
     async fn messages_valid_minimal_payload_translates_and_returns_ok() {
         let (base_url, _server) = spawn_mock_openai_server().await;
         let app = build_router(test_state_with_base_url(base_url));
@@ -1300,6 +1546,73 @@ mod tests {
             .expect("usage should be present in response");
         assert_eq!(usage["input_tokens"], 10);
         assert_eq!(usage["output_tokens"], 20);
+    }
+
+    #[tokio::test]
+    async fn messages_non_stream_tools_are_mapped_end_to_end() {
+        let (base_url, _server) = spawn_mock_openai_tool_server().await;
+        let app = build_router(test_state_with_base_url(base_url));
+        let payload = r#"{
+            "model":"claude-sonnet-4",
+            "stream":false,
+            "messages":[{"role":"user","content":"Use a tool"}],
+            "tools":[
+                {
+                    "name":"weather_lookup",
+                    "description":"Get weather",
+                    "input_schema":{
+                        "type":"object",
+                        "properties":{"city":{"type":"string"}},
+                        "required":["city"]
+                    }
+                }
+            ]
+        }"#;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("content-type", "application/json")
+                    .header("x-api-key", "dummy")
+                    .body(Body::from(payload))
+                    .expect("request build should succeed"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = parse_json_body(response).await;
+        assert_eq!(body.get("type").and_then(Value::as_str), Some("message"));
+        assert_eq!(
+            body.get("stop_reason").and_then(Value::as_str),
+            Some("tool_use")
+        );
+        let content_blocks = body
+            .get("content")
+            .and_then(Value::as_array)
+            .expect("content should be array");
+        let tool_use = content_blocks
+            .iter()
+            .find(|block| block.get("type").and_then(Value::as_str) == Some("tool_use"))
+            .expect("tool_use block should be present");
+        assert_eq!(
+            tool_use.get("id").and_then(Value::as_str),
+            Some("call_weather")
+        );
+        assert_eq!(
+            tool_use.get("name").and_then(Value::as_str),
+            Some("weather_lookup")
+        );
+        assert_eq!(
+            tool_use
+                .get("input")
+                .and_then(Value::as_object)
+                .and_then(|obj| obj.get("city"))
+                .and_then(Value::as_str),
+            Some("Paris")
+        );
     }
 
     #[tokio::test]
@@ -1451,6 +1764,122 @@ mod tests {
         assert!(
             !event_names.contains(&"message_stop"),
             "terminal success event must not be emitted on stream parse failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn messages_stream_unknown_events_and_tool_deltas_are_handled_gracefully() {
+        let (base_url, _server) = spawn_mock_openai_stream_with_unknown_event_server().await;
+        let app = build_router(test_state_with_base_url(base_url));
+        let payload = r#"{"model":"claude-sonnet-4","stream":true,"messages":[{"role":"user","content":"Hello"}]}"#;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("content-type", "application/json")
+                    .header("x-api-key", "dummy")
+                    .body(Body::from(payload))
+                    .expect("request build should succeed"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("text/event-stream")
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should be readable");
+        let body_text = String::from_utf8(body.to_vec()).expect("body should be utf8");
+        let events = parse_sse_events(&body_text);
+        let event_names: Vec<&str> = events.iter().map(|(name, _)| name.as_str()).collect();
+
+        // tool_calls delta produces tool_use block, then text content produces text block
+        assert_eq!(
+            event_names,
+            vec![
+                "message_start",
+                "content_block_start", // tool_use (index 0)
+                "content_block_delta", // input_json_delta
+                "content_block_stop",  // close tool block
+                "content_block_start", // text (index 1)
+                "content_block_delta", // text_delta STREAM_OK
+                "content_block_stop",  // close text block
+                "message_delta",
+                "message_stop"
+            ]
+        );
+        assert!(
+            !event_names.contains(&"error"),
+            "unknown stream event payloads should not crash the parser"
+        );
+
+        // Verify tool_use content block
+        let first_block_start = &events[1].1;
+        assert_eq!(
+            first_block_start
+                .get("content_block")
+                .and_then(|cb| cb.get("type"))
+                .and_then(Value::as_str),
+            Some("tool_use"),
+            "first content block should be tool_use"
+        );
+        assert_eq!(
+            first_block_start
+                .get("content_block")
+                .and_then(|cb| cb.get("id"))
+                .and_then(Value::as_str),
+            Some("call_1"),
+            "tool_use block should have correct id"
+        );
+        assert_eq!(
+            first_block_start
+                .get("content_block")
+                .and_then(|cb| cb.get("name"))
+                .and_then(Value::as_str),
+            Some("lookup"),
+            "tool_use block should have correct name"
+        );
+
+        // Verify input_json_delta
+        let tool_delta = &events[2].1;
+        assert_eq!(
+            tool_delta
+                .get("delta")
+                .and_then(|d| d.get("type"))
+                .and_then(Value::as_str),
+            Some("input_json_delta"),
+            "tool delta should be input_json_delta type"
+        );
+
+        // Verify text block has index 1 (incremented)
+        let text_block_start = &events[4].1;
+        assert_eq!(
+            text_block_start.get("index").and_then(Value::as_u64),
+            Some(1),
+            "text block should have index 1 after tool block"
+        );
+
+        // Verify message_delta stop_reason
+        let message_delta = events
+            .iter()
+            .find(|(name, _)| name == "message_delta")
+            .map(|(_, data)| data)
+            .expect("message_delta event should exist");
+        assert_eq!(
+            message_delta
+                .get("delta")
+                .and_then(Value::as_object)
+                .and_then(|delta| delta.get("stop_reason"))
+                .and_then(Value::as_str),
+            Some("tool_use")
         );
     }
 
@@ -1819,6 +2248,70 @@ mod tests {
         (format!("http://{}", addr), handle)
     }
 
+    async fn spawn_mock_openai_tool_server() -> (String, tokio::task::JoinHandle<()>) {
+        async fn chat_completions_tool_handler(
+            Json(body): Json<Value>,
+        ) -> (StatusCode, Json<Value>) {
+            let tools = body
+                .get("tools")
+                .and_then(Value::as_array)
+                .expect("tools should exist in upstream request");
+            let first_tool = tools.first().expect("at least one tool should exist");
+            assert_eq!(
+                first_tool.get("type").and_then(Value::as_str),
+                Some("function")
+            );
+            assert_eq!(
+                first_tool
+                    .get("function")
+                    .and_then(Value::as_object)
+                    .and_then(|f| f.get("name"))
+                    .and_then(Value::as_str),
+                Some("weather_lookup")
+            );
+
+            let response = json!({
+                "id": "chatcmpl-tools",
+                "model": "openai-test-model",
+                "choices": [{
+                    "index": 0,
+                    "finish_reason": "tool_calls",
+                    "message": {
+                        "role": "assistant",
+                        "content": null,
+                        "tool_calls": [{
+                            "id": "call_weather",
+                            "type": "function",
+                            "function": {
+                                "name": "weather_lookup",
+                                "arguments": "{\"city\":\"Paris\"}"
+                            }
+                        }]
+                    }
+                }],
+                "usage": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 5,
+                    "total_tokens": 15
+                }
+            });
+            (StatusCode::OK, Json(response))
+        }
+
+        let app = Router::new().route("/chat/completions", post(chat_completions_tool_handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener bind should succeed");
+        let addr = listener
+            .local_addr()
+            .expect("listener should have a local address");
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        (format!("http://{}", addr), handle)
+    }
+
     async fn spawn_mock_openai_error_server() -> (String, tokio::task::JoinHandle<()>) {
         async fn chat_completions_error_handler() -> (StatusCode, &'static str) {
             (StatusCode::INTERNAL_SERVER_ERROR, "boom")
@@ -1906,6 +2399,46 @@ mod tests {
                 "\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",",
                 "\"content\":\"STREAM_OK\"},\"finish_reason\":null}]}\n\n",
                 "data: {bad-json}\n\n"
+            );
+            HttpResponse::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "text/event-stream")
+                .body(Body::from(payload))
+                .expect("response build should succeed")
+        }
+
+        let app = Router::new().route("/chat/completions", post(chat_completions_stream_handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener bind should succeed");
+        let addr = listener
+            .local_addr()
+            .expect("listener should have a local address");
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        (format!("http://{}", addr), handle)
+    }
+
+    async fn spawn_mock_openai_stream_with_unknown_event_server()
+    -> (String, tokio::task::JoinHandle<()>) {
+        async fn chat_completions_stream_handler(Json(body): Json<Value>) -> HttpResponse<Body> {
+            assert_eq!(
+                body.get("stream").and_then(Value::as_bool),
+                Some(true),
+                "upstream request must contain stream: true"
+            );
+            let payload = concat!(
+                "event: ping\ndata: {\"type\":\"ping\"}\n\n",
+                "data: {\"id\":\"chatcmpl-stream\",\"model\":\"openai-test-model\",",
+                "\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"id\":\"call_1\",",
+                "\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{}\"}}]},",
+                "\"finish_reason\":null}]}\n\n",
+                "data: {\"id\":\"chatcmpl-stream\",\"model\":\"openai-test-model\",",
+                "\"choices\":[{\"index\":0,\"delta\":{\"content\":\"STREAM_OK\"},",
+                "\"finish_reason\":\"tool_calls\"}]}\n\n",
+                "data: [DONE]\n\n"
             );
             HttpResponse::builder()
                 .status(StatusCode::OK)

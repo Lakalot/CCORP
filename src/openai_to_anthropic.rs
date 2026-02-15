@@ -1,7 +1,7 @@
 use crate::models::*;
 use serde_json::json;
 
-pub fn format_openai_to_anthropic(resp: OpenAIResponse) -> AnthropicResponse {
+pub fn format_openai_to_anthropic(resp: OpenAIResponse) -> Result<AnthropicResponse, String> {
     let choice = resp.choices.first();
     let mut content = Vec::new();
 
@@ -12,11 +12,19 @@ pub fn format_openai_to_anthropic(resp: OpenAIResponse) -> AnthropicResponse {
 
         if let Some(tool_calls) = &choice.message.tool_calls {
             for tool_call in tool_calls {
+                let input =
+                    serde_json::from_str::<serde_json::Value>(&tool_call.function.arguments)
+                        .map_err(|e| {
+                            format!(
+                                "Invalid tool_call arguments JSON for '{}': {e}",
+                                tool_call.function.name
+                            )
+                        })?;
                 content.push(json!({
                     "type": "tool_use",
                     "id": tool_call.id,
                     "name": tool_call.function.name,
-                    "input": serde_json::from_str::<serde_json::Value>(&tool_call.function.arguments).unwrap_or(json!({})),
+                    "input": input,
                 }));
             }
         }
@@ -40,7 +48,7 @@ pub fn format_openai_to_anthropic(resp: OpenAIResponse) -> AnthropicResponse {
         output_tokens: u.completion_tokens,
     });
 
-    AnthropicResponse {
+    Ok(AnthropicResponse {
         id,
         response_type: "message".to_string(),
         role: "assistant".to_string(),
@@ -49,7 +57,7 @@ pub fn format_openai_to_anthropic(resp: OpenAIResponse) -> AnthropicResponse {
         stop_sequence: None,
         model: resp.model,
         usage,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -101,7 +109,7 @@ mod tests {
             usage: None,
         };
 
-        let mapped = format_openai_to_anthropic(response);
+        let mapped = format_openai_to_anthropic(response).expect("mapping should succeed");
 
         assert_eq!(mapped.response_type, "message");
         assert_eq!(mapped.role, "assistant");
@@ -133,8 +141,8 @@ mod tests {
             }),
         };
 
-        let mapped_first = format_openai_to_anthropic(first);
-        let mapped_second = format_openai_to_anthropic(second);
+        let mapped_first = format_openai_to_anthropic(first).expect("mapping should succeed");
+        let mapped_second = format_openai_to_anthropic(second).expect("mapping should succeed");
 
         assert_eq!(
             serde_json::to_value(mapped_first).expect("first mapping should serialize"),
@@ -150,7 +158,12 @@ mod tests {
             model: "test".to_string(),
             usage: None,
         };
-        assert_eq!(format_openai_to_anthropic(response).stop_reason, "tool_use");
+        assert_eq!(
+            format_openai_to_anthropic(response)
+                .expect("mapping should succeed")
+                .stop_reason,
+            "tool_use"
+        );
     }
 
     #[test]
@@ -162,7 +175,9 @@ mod tests {
             usage: None,
         };
         assert_eq!(
-            format_openai_to_anthropic(response).stop_reason,
+            format_openai_to_anthropic(response)
+                .expect("mapping should succeed")
+                .stop_reason,
             "max_tokens"
         );
     }
@@ -175,7 +190,12 @@ mod tests {
             model: "test".to_string(),
             usage: None,
         };
-        assert_eq!(format_openai_to_anthropic(response).stop_reason, "end_turn");
+        assert_eq!(
+            format_openai_to_anthropic(response)
+                .expect("mapping should succeed")
+                .stop_reason,
+            "end_turn"
+        );
     }
 
     #[test]
@@ -186,7 +206,7 @@ mod tests {
             model: "test".to_string(),
             usage: None,
         };
-        let mapped = format_openai_to_anthropic(response);
+        let mapped = format_openai_to_anthropic(response).expect("mapping should succeed");
         assert!(
             mapped.id.starts_with("msg_"),
             "ID should start with msg_ prefix, got: {}",
@@ -202,7 +222,7 @@ mod tests {
             model: "test".to_string(),
             usage: None,
         };
-        let mapped = format_openai_to_anthropic(response);
+        let mapped = format_openai_to_anthropic(response).expect("mapping should succeed");
         assert_eq!(mapped.id, "msg_already-prefixed");
     }
 
@@ -218,9 +238,114 @@ mod tests {
                 total_tokens: 142,
             }),
         };
-        let mapped = format_openai_to_anthropic(response);
+        let mapped = format_openai_to_anthropic(response).expect("mapping should succeed");
         let usage = mapped.usage.expect("usage should be present");
         assert_eq!(usage.input_tokens, 42);
         assert_eq!(usage.output_tokens, 100);
+    }
+
+    #[test]
+    fn tool_calls_with_null_content_produce_only_tool_use_blocks() {
+        let response = OpenAIResponse {
+            id: "chatcmpl-tool-only".to_string(),
+            choices: vec![OpenAIChoice {
+                index: 0,
+                message: OpenAIMessage {
+                    role: "assistant".to_string(),
+                    content: None,
+                    tool_calls: Some(vec![OpenAIToolCall {
+                        id: "call_1".to_string(),
+                        tool_type: "function".to_string(),
+                        function: OpenAIFunction {
+                            name: "weather".to_string(),
+                            arguments: r#"{"city":"Paris"}"#.to_string(),
+                        },
+                    }]),
+                    tool_call_id: None,
+                },
+                finish_reason: "tool_calls".to_string(),
+            }],
+            model: "test".to_string(),
+            usage: None,
+        };
+
+        let mapped = format_openai_to_anthropic(response).expect("mapping should succeed");
+        assert_eq!(mapped.stop_reason, "tool_use");
+        assert_eq!(
+            mapped.content.len(),
+            1,
+            "only tool_use block, no text block"
+        );
+        assert_eq!(
+            mapped.content[0].get("type").and_then(|v| v.as_str()),
+            Some("tool_use")
+        );
+    }
+
+    #[test]
+    fn malformed_tool_call_arguments_returns_error() {
+        let response = OpenAIResponse {
+            id: "chatcmpl-bad-args".to_string(),
+            choices: vec![OpenAIChoice {
+                index: 0,
+                message: OpenAIMessage {
+                    role: "assistant".to_string(),
+                    content: None,
+                    tool_calls: Some(vec![OpenAIToolCall {
+                        id: "call_1".to_string(),
+                        tool_type: "function".to_string(),
+                        function: OpenAIFunction {
+                            name: "weather".to_string(),
+                            arguments: "{bad-json}".to_string(),
+                        },
+                    }]),
+                    tool_call_id: None,
+                },
+                finish_reason: "tool_calls".to_string(),
+            }],
+            model: "test".to_string(),
+            usage: None,
+        };
+
+        let err = format_openai_to_anthropic(response).expect_err("should fail on bad arguments");
+        assert!(
+            err.contains("Invalid tool_call arguments JSON"),
+            "error should mention invalid arguments: {err}"
+        );
+    }
+
+    #[test]
+    fn tool_calls_are_mapped_to_tool_use_with_stable_fields() {
+        let response = OpenAIResponse {
+            id: "chatcmpl-tool".to_string(),
+            choices: vec![sample_choice_with_tool_call(r#"{"city":"Paris"}"#)],
+            model: "test".to_string(),
+            usage: None,
+        };
+
+        let mapped = format_openai_to_anthropic(response).expect("mapping should succeed");
+        assert_eq!(mapped.stop_reason, "tool_use");
+        assert_eq!(mapped.content.len(), 2);
+
+        let tool_block = mapped
+            .content
+            .iter()
+            .find(|block| block.get("type").and_then(|v| v.as_str()) == Some("tool_use"))
+            .expect("tool_use block should exist");
+        assert_eq!(
+            tool_block.get("id").and_then(|v| v.as_str()),
+            Some("tool-1")
+        );
+        assert_eq!(
+            tool_block.get("name").and_then(|v| v.as_str()),
+            Some("lookup")
+        );
+        assert_eq!(
+            tool_block
+                .get("input")
+                .and_then(|v| v.get("city"))
+                .and_then(|v| v.as_str()),
+            Some("Paris")
+        );
     }
 }

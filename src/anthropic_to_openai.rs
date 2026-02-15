@@ -1,6 +1,7 @@
 use crate::config::Config;
 use crate::models::*;
 use serde_json::json;
+use std::collections::HashSet;
 use std::fmt;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,7 +43,15 @@ pub fn format_anthropic_to_openai(
     req: AnthropicRequest,
     settings: &Config,
 ) -> Result<OpenAIRequest, TranslationError> {
+    if req.top_k.is_some() {
+        tracing::debug!("top_k parameter is not forwarded to OpenAI-compatible upstream");
+    }
+    if req.metadata.is_some() {
+        tracing::debug!("metadata parameter is not forwarded to OpenAI-compatible upstream");
+    }
+
     let mut openapi_messages = Vec::new();
+    let mut known_tool_use_ids = HashSet::new();
 
     if let Some(system) = req.system {
         let system_text = parse_system_content(&system)?;
@@ -83,6 +92,11 @@ pub fn format_anthropic_to_openai(
                                             "Invalid tool_result block: missing tool_use_id",
                                         )
                                     })?;
+                                if !known_tool_use_ids.contains(tool_use_id) {
+                                    return Err(TranslationError::new(format!(
+                                        "Invalid tool_result block: unknown tool_use_id {tool_use_id}"
+                                    )));
+                                }
                                 let result_content = content.get("content").ok_or_else(|| {
                                     TranslationError::new(
                                         "Invalid tool_result block: missing content",
@@ -156,6 +170,16 @@ pub fn format_anthropic_to_openai(
                                     .ok_or_else(|| {
                                         TranslationError::new("Invalid tool_use block: missing id")
                                     })?;
+                                if tool_id.is_empty() {
+                                    return Err(TranslationError::new(
+                                        "Invalid tool_use block: empty id",
+                                    ));
+                                }
+                                if !known_tool_use_ids.insert(tool_id.to_string()) {
+                                    return Err(TranslationError::new(format!(
+                                        "Invalid tool_use block: duplicate id {tool_id}"
+                                    )));
+                                }
                                 let tool_name = content
                                     .get("name")
                                     .and_then(|v| v.as_str())
@@ -214,22 +238,17 @@ pub fn format_anthropic_to_openai(
 
     let mut tools = None;
     if let Some(anthropic_tools) = req.tools {
-        tools = Some(
-            anthropic_tools
-                .into_iter()
-                .map(|t| {
-                    json!({
-                        "type": "function",
-                        "function": {
-                            "name": t["name"],
-                            "description": t["description"],
-                            "parameters": t["input_schema"],
-                        }
-                    })
-                })
-                .collect(),
-        );
+        let mut mapped_tools = Vec::with_capacity(anthropic_tools.len());
+        for tool in anthropic_tools {
+            mapped_tools.push(validate_and_map_tool_definition(tool)?);
+        }
+        tools = Some(mapped_tools);
     }
+
+    let tool_choice = match req.tool_choice {
+        Some(tc) => Some(map_tool_choice(&tc)?),
+        None => None,
+    };
 
     Ok(OpenAIRequest {
         model: map_model(&req.model, settings),
@@ -240,7 +259,70 @@ pub fn format_anthropic_to_openai(
         stop: req.stop_sequences,
         stream: req.stream,
         tools,
+        tool_choice,
     })
+}
+
+fn validate_and_map_tool_definition(
+    tool: serde_json::Value,
+) -> Result<serde_json::Value, TranslationError> {
+    let name = tool
+        .get("name")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| TranslationError::new("Invalid tool definition: missing name"))?;
+    if name.is_empty() {
+        return Err(TranslationError::new("Invalid tool definition: empty name"));
+    }
+
+    let input_schema = tool
+        .get("input_schema")
+        .ok_or_else(|| TranslationError::new("Invalid tool definition: missing input_schema"))?;
+    if !input_schema.is_object() {
+        return Err(TranslationError::new(
+            "Invalid tool definition: input_schema must be an object",
+        ));
+    }
+
+    let description = match tool.get("description") {
+        None => serde_json::Value::Null,
+        Some(value) if value.is_string() => value.clone(),
+        Some(_) => {
+            return Err(TranslationError::new(
+                "Invalid tool definition: description must be a string",
+            ));
+        }
+    };
+
+    Ok(json!({
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": description,
+            "parameters": input_schema,
+        }
+    }))
+}
+
+fn map_tool_choice(
+    anthropic_tc: &serde_json::Value,
+) -> Result<serde_json::Value, TranslationError> {
+    match anthropic_tc.get("type").and_then(|v| v.as_str()) {
+        Some("auto") => Ok(json!("auto")),
+        Some("any") => Ok(json!("required")),
+        Some("tool") => {
+            let name = anthropic_tc
+                .get("name")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    TranslationError::new("Invalid tool_choice: missing name for type 'tool'")
+                })?;
+            Ok(json!({"type": "function", "function": {"name": name}}))
+        }
+        other => Err(TranslationError::new(format!(
+            "Invalid tool_choice: unsupported type '{}'",
+            other.unwrap_or("null")
+        ))),
+    }
 }
 
 fn parse_system_content(system: &serde_json::Value) -> Result<String, TranslationError> {
@@ -478,6 +560,54 @@ mod tests {
         assert_eq!(mapped.stop, None);
         assert_eq!(mapped.stream, None);
         assert!(mapped.tools.is_none());
+        assert!(mapped.tool_choice.is_none());
+    }
+
+    #[test]
+    fn format_maps_tool_choice_auto() {
+        let cfg = test_config();
+        let req: AnthropicRequest = serde_json::from_value(json!({
+            "model":"claude-sonnet-4",
+            "messages":[{"role":"user","content":"Hi"}],
+            "tools":[{"name":"t","input_schema":{"type":"object"}}],
+            "tool_choice":{"type":"auto"}
+        }))
+        .expect("request should deserialize");
+
+        let mapped = format_anthropic_to_openai(req, &cfg).expect("translation should succeed");
+        assert_eq!(mapped.tool_choice.unwrap(), json!("auto"));
+    }
+
+    #[test]
+    fn format_maps_tool_choice_any_to_required() {
+        let cfg = test_config();
+        let req: AnthropicRequest = serde_json::from_value(json!({
+            "model":"claude-sonnet-4",
+            "messages":[{"role":"user","content":"Hi"}],
+            "tools":[{"name":"t","input_schema":{"type":"object"}}],
+            "tool_choice":{"type":"any"}
+        }))
+        .expect("request should deserialize");
+
+        let mapped = format_anthropic_to_openai(req, &cfg).expect("translation should succeed");
+        assert_eq!(mapped.tool_choice.unwrap(), json!("required"));
+    }
+
+    #[test]
+    fn format_maps_tool_choice_specific_tool() {
+        let cfg = test_config();
+        let req: AnthropicRequest = serde_json::from_value(json!({
+            "model":"claude-sonnet-4",
+            "messages":[{"role":"user","content":"Hi"}],
+            "tools":[{"name":"weather","input_schema":{"type":"object"}}],
+            "tool_choice":{"type":"tool","name":"weather"}
+        }))
+        .expect("request should deserialize");
+
+        let mapped = format_anthropic_to_openai(req, &cfg).expect("translation should succeed");
+        let tc = mapped.tool_choice.unwrap();
+        assert_eq!(tc["type"], "function");
+        assert_eq!(tc["function"]["name"], "weather");
     }
 
     #[test]
@@ -532,6 +662,68 @@ mod tests {
         assert_eq!(
             tools[0]["function"]["parameters"]["properties"]["city"]["type"],
             "string"
+        );
+    }
+
+    #[test]
+    fn format_rejects_tool_result_with_unknown_tool_use_id() {
+        let cfg = test_config();
+        let req: AnthropicRequest = serde_json::from_value(json!({
+            "model":"claude-sonnet-4",
+            "messages":[
+                {"role":"user","content":[
+                    {"type":"tool_result","tool_use_id":"missing","content":{"ok":true}}
+                ]}
+            ]
+        }))
+        .expect("request should deserialize");
+
+        let err = format_anthropic_to_openai(req, &cfg).expect_err("translation should fail");
+        assert_eq!(
+            err.message(),
+            "Invalid tool_result block: unknown tool_use_id missing"
+        );
+    }
+
+    #[test]
+    fn format_rejects_malformed_tool_definition_without_name() {
+        let cfg = test_config();
+        let req: AnthropicRequest = serde_json::from_value(json!({
+            "model":"claude-sonnet-4",
+            "messages":[{"role":"user","content":"Hi"}],
+            "tools":[
+                {
+                    "description":"Get weather",
+                    "input_schema":{"type":"object"}
+                }
+            ]
+        }))
+        .expect("request should deserialize");
+
+        let err = format_anthropic_to_openai(req, &cfg).expect_err("translation should fail");
+        assert_eq!(err.message(), "Invalid tool definition: missing name");
+    }
+
+    #[test]
+    fn format_rejects_tool_definition_with_non_object_input_schema() {
+        let cfg = test_config();
+        let req: AnthropicRequest = serde_json::from_value(json!({
+            "model":"claude-sonnet-4",
+            "messages":[{"role":"user","content":"Hi"}],
+            "tools":[
+                {
+                    "name":"weather_lookup",
+                    "description":"Get weather",
+                    "input_schema":"not-an-object"
+                }
+            ]
+        }))
+        .expect("request should deserialize");
+
+        let err = format_anthropic_to_openai(req, &cfg).expect_err("translation should fail");
+        assert_eq!(
+            err.message(),
+            "Invalid tool definition: input_schema must be an object"
         );
     }
 }

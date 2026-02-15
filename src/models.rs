@@ -27,6 +27,8 @@ pub struct AnthropicRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<serde_json::Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub stream: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
@@ -95,6 +97,8 @@ pub struct OpenAIRequest {
     pub stream: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<serde_json::Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -118,18 +122,4 @@ pub struct OpenAIChoice {
     pub index: u32,
     pub message: OpenAIMessage,
     pub finish_reason: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct OpenAIStreamChoice {
-    pub index: u32,
-    pub delta: OpenAIMessage,
-    pub finish_reason: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct OpenAIStreamResponse {
-    pub id: String,
-    pub choices: Vec<OpenAIStreamChoice>,
-    pub model: String,
 }
