@@ -806,6 +806,15 @@ mod tests {
     use tokio::sync::{RwLock, oneshot};
     use tower::util::ServiceExt;
 
+    /// Wrapper that aborts the mock server task on drop for clean test teardown.
+    struct MockServer(tokio::task::JoinHandle<()>);
+
+    impl Drop for MockServer {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+
     #[test]
     fn request_id_is_generated_with_expected_prefix() {
         let request_id = next_request_id();
@@ -965,7 +974,7 @@ mod tests {
         ];
 
         for case in cases {
-            let mut mock_handle: Option<tokio::task::JoinHandle<()>> = None;
+            let mut mock_handle: Option<MockServer> = None;
             let app = match case.upstream_mode {
                 UpstreamMode::None => build_router(test_state()),
                 UpstreamMode::Success => {
@@ -1101,9 +1110,7 @@ mod tests {
                 );
             }
 
-            if let Some(handle) = mock_handle {
-                handle.abort();
-            }
+            drop(mock_handle);
         }
     }
 
@@ -1384,6 +1391,11 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let body = parse_json_body(response).await;
+        assert_eq!(
+            body.get("type").and_then(Value::as_str),
+            Some("error"),
+            "envelope must have top-level type: error"
+        );
         let error = body
             .get("error")
             .and_then(Value::as_object)
@@ -1395,6 +1407,64 @@ mod tests {
         assert_eq!(
             error.get("message").and_then(Value::as_str),
             Some("Invalid Anthropic payload: Invalid tool definition: missing name")
+        );
+        assert!(
+            error
+                .get("request_id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| id.starts_with("req-")),
+            "request_id must be present and use req- prefix"
+        );
+    }
+
+    #[tokio::test]
+    async fn messages_stream_malformed_tool_definition_returns_local_validation_error() {
+        let app = build_router(test_state());
+        let payload = r#"{
+            "model":"claude-sonnet-4",
+            "stream":true,
+            "messages":[{"role":"user","content":"Hello"}],
+            "tools":[{"description":"missing name","input_schema":{"type":"object"}}]
+        }"#;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("content-type", "application/json")
+                    .header("x-api-key", "dummy")
+                    .body(Body::from(payload))
+                    .expect("request build should succeed"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = parse_json_body(response).await;
+        assert_eq!(
+            body.get("type").and_then(Value::as_str),
+            Some("error"),
+            "envelope must have top-level type: error"
+        );
+        let error = body
+            .get("error")
+            .and_then(Value::as_object)
+            .expect("error envelope should exist");
+        assert_eq!(
+            error.get("source").and_then(Value::as_str),
+            Some("local_validation")
+        );
+        assert_eq!(
+            error.get("message").and_then(Value::as_str),
+            Some("Invalid Anthropic payload: Invalid tool definition: missing name")
+        );
+        assert!(
+            error
+                .get("request_id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| id.starts_with("req-")),
+            "request_id must be present and use req- prefix"
         );
     }
 
@@ -1679,21 +1749,7 @@ mod tests {
                 "error"
             ]
         );
-        let error_payload = events
-            .last()
-            .expect("error event must exist")
-            .1
-            .get("error")
-            .cloned()
-            .expect("error body must exist");
-        assert_eq!(
-            error_payload.get("source").and_then(Value::as_str),
-            Some("upstream")
-        );
-        assert_eq!(
-            error_payload.get("request_id").and_then(Value::as_str),
-            Some(request_id_header.as_str())
-        );
+        assert_stream_error_is_canonical_and_terminal(&events, &request_id_header, "upstream");
         assert!(
             !event_names.contains(&"message_stop"),
             "terminal success event must not be emitted on stream parse failure"
@@ -1743,6 +1799,7 @@ mod tests {
                 "error"
             ]
         );
+        assert_stream_error_is_canonical_and_terminal(&events, &request_id_header, "upstream");
         let error_payload = events
             .last()
             .expect("error event must exist")
@@ -1750,14 +1807,6 @@ mod tests {
             .get("error")
             .cloned()
             .expect("error body must exist");
-        assert_eq!(
-            error_payload.get("source").and_then(Value::as_str),
-            Some("upstream")
-        );
-        assert_eq!(
-            error_payload.get("request_id").and_then(Value::as_str),
-            Some(request_id_header.as_str())
-        );
         assert_eq!(
             error_payload.get("message").and_then(Value::as_str),
             Some("Streaming response interrupted")
@@ -2142,18 +2191,15 @@ mod tests {
         let event_names: Vec<&str> = events.iter().map(|(name, _)| name.as_str()).collect();
 
         assert_eq!(event_names, vec!["error"]);
+        assert_stream_error_is_canonical_and_terminal(&events, &request_id_header, "upstream");
         let error_payload = events[0]
             .1
             .get("error")
             .cloned()
             .expect("error body must exist");
         assert_eq!(
-            error_payload.get("source").and_then(Value::as_str),
-            Some("upstream")
-        );
-        assert_eq!(
-            error_payload.get("request_id").and_then(Value::as_str),
-            Some(request_id_header.as_str())
+            error_payload.get("message").and_then(Value::as_str),
+            Some("Failed to contact upstream provider")
         );
     }
 
@@ -2198,18 +2244,15 @@ mod tests {
         let event_names: Vec<&str> = events.iter().map(|(name, _)| name.as_str()).collect();
 
         assert_eq!(event_names, vec!["error"]);
+        assert_stream_error_is_canonical_and_terminal(&events, &request_id_header, "upstream");
         let error_payload = events[0]
             .1
             .get("error")
             .cloned()
             .expect("error body must exist");
         assert_eq!(
-            error_payload.get("source").and_then(Value::as_str),
-            Some("upstream")
-        );
-        assert_eq!(
-            error_payload.get("request_id").and_then(Value::as_str),
-            Some(request_id_header.as_str())
+            error_payload.get("message").and_then(Value::as_str),
+            Some("Upstream provider returned an error")
         );
     }
 
@@ -2254,26 +2297,19 @@ mod tests {
         let event_names: Vec<&str> = events.iter().map(|(name, _)| name.as_str()).collect();
 
         assert_eq!(event_names, vec!["error"]);
+        assert_stream_error_is_canonical_and_terminal(&events, &request_id_header, "upstream");
         let error_payload = events[0]
             .1
             .get("error")
             .cloned()
             .expect("error body must exist");
         assert_eq!(
-            error_payload.get("source").and_then(Value::as_str),
-            Some("upstream")
-        );
-        assert_eq!(
             error_payload.get("message").and_then(Value::as_str),
             Some("Upstream provider rate-limited")
         );
-        assert_eq!(
-            error_payload.get("request_id").and_then(Value::as_str),
-            Some(request_id_header.as_str())
-        );
     }
 
-    async fn spawn_mock_openai_server() -> (String, tokio::task::JoinHandle<()>) {
+    async fn spawn_mock_openai_server() -> (String, MockServer) {
         async fn chat_completions_handler() -> (StatusCode, Json<serde_json::Value>) {
             let response = json!({
                 "id": "chatcmpl-test",
@@ -2306,10 +2342,10 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
 
-        (format!("http://{}", addr), handle)
+        (format!("http://{}", addr), MockServer(handle))
     }
 
-    async fn spawn_mock_openai_tool_server() -> (String, tokio::task::JoinHandle<()>) {
+    async fn spawn_mock_openai_tool_server() -> (String, MockServer) {
         async fn chat_completions_tool_handler(
             Json(body): Json<Value>,
         ) -> (StatusCode, Json<Value>) {
@@ -2370,10 +2406,10 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
 
-        (format!("http://{}", addr), handle)
+        (format!("http://{}", addr), MockServer(handle))
     }
 
-    async fn spawn_mock_openai_error_server() -> (String, tokio::task::JoinHandle<()>) {
+    async fn spawn_mock_openai_error_server() -> (String, MockServer) {
         async fn chat_completions_error_handler() -> (StatusCode, &'static str) {
             (StatusCode::INTERNAL_SERVER_ERROR, "boom")
         }
@@ -2389,10 +2425,10 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
 
-        (format!("http://{}", addr), handle)
+        (format!("http://{}", addr), MockServer(handle))
     }
 
-    async fn spawn_mock_openai_rate_limited_server() -> (String, tokio::task::JoinHandle<()>) {
+    async fn spawn_mock_openai_rate_limited_server() -> (String, MockServer) {
         async fn chat_completions_rate_limited_handler() -> (StatusCode, &'static str) {
             (StatusCode::TOO_MANY_REQUESTS, "rate-limited")
         }
@@ -2411,10 +2447,10 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
 
-        (format!("http://{}", addr), handle)
+        (format!("http://{}", addr), MockServer(handle))
     }
 
-    async fn spawn_mock_openai_invalid_json_server() -> (String, tokio::task::JoinHandle<()>) {
+    async fn spawn_mock_openai_invalid_json_server() -> (String, MockServer) {
         async fn chat_completions_invalid_json_handler() -> (StatusCode, &'static str) {
             (StatusCode::OK, "this is not json")
         }
@@ -2433,10 +2469,10 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
 
-        (format!("http://{}", addr), handle)
+        (format!("http://{}", addr), MockServer(handle))
     }
 
-    async fn spawn_mock_openai_stream_server() -> (String, tokio::task::JoinHandle<()>) {
+    async fn spawn_mock_openai_stream_server() -> (String, MockServer) {
         async fn chat_completions_stream_handler(Json(body): Json<Value>) -> HttpResponse<Body> {
             assert_eq!(
                 body.get("stream").and_then(Value::as_bool),
@@ -2467,10 +2503,10 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
 
-        (format!("http://{}", addr), handle)
+        (format!("http://{}", addr), MockServer(handle))
     }
 
-    async fn spawn_mock_openai_malformed_stream_server() -> (String, tokio::task::JoinHandle<()>) {
+    async fn spawn_mock_openai_malformed_stream_server() -> (String, MockServer) {
         async fn chat_completions_stream_handler(Json(body): Json<Value>) -> HttpResponse<Body> {
             assert_eq!(
                 body.get("stream").and_then(Value::as_bool),
@@ -2501,11 +2537,10 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
 
-        (format!("http://{}", addr), handle)
+        (format!("http://{}", addr), MockServer(handle))
     }
 
-    async fn spawn_mock_openai_stream_with_unknown_event_server()
-    -> (String, tokio::task::JoinHandle<()>) {
+    async fn spawn_mock_openai_stream_with_unknown_event_server() -> (String, MockServer) {
         async fn chat_completions_stream_handler(Json(body): Json<Value>) -> HttpResponse<Body> {
             assert_eq!(
                 body.get("stream").and_then(Value::as_bool),
@@ -2541,10 +2576,10 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
 
-        (format!("http://{}", addr), handle)
+        (format!("http://{}", addr), MockServer(handle))
     }
 
-    async fn spawn_mock_openai_truncated_stream_server() -> (String, tokio::task::JoinHandle<()>) {
+    async fn spawn_mock_openai_truncated_stream_server() -> (String, MockServer) {
         async fn chat_completions_stream_handler(Json(body): Json<Value>) -> HttpResponse<Body> {
             assert_eq!(
                 body.get("stream").and_then(Value::as_bool),
@@ -2574,7 +2609,7 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
 
-        (format!("http://{}", addr), handle)
+        (format!("http://{}", addr), MockServer(handle))
     }
 
     async fn parse_json_body(response: Response) -> Value {
@@ -2592,21 +2627,66 @@ mod tests {
                 if trimmed.is_empty() {
                     return None;
                 }
+                if trimmed == "data: [DONE]" {
+                    return None;
+                }
                 let mut event_name: Option<String> = None;
                 let mut data_payload: Option<Value> = None;
+                let mut has_data_line = false;
                 for line in trimmed.lines() {
                     if let Some(name) = line.strip_prefix("event: ") {
                         event_name = Some(name.to_string());
                     } else if let Some(data) = line.strip_prefix("data: ") {
+                        has_data_line = true;
                         data_payload = serde_json::from_str::<Value>(data).ok();
                     }
                 }
-                Some((event_name?, data_payload?))
+                if event_name.is_some() || has_data_line {
+                    let name = event_name.unwrap_or_else(|| {
+                        panic!("SSE frame has data but no event name: {trimmed}")
+                    });
+                    let payload = data_payload.unwrap_or_else(|| {
+                        panic!("SSE frame '{name}' has unparseable data: {trimmed}")
+                    });
+                    Some((name, payload))
+                } else {
+                    None
+                }
             })
             .collect()
     }
 
-    async fn spawn_mock_openai_stalled_stream_server() -> (String, tokio::task::JoinHandle<()>) {
+    fn assert_stream_error_is_canonical_and_terminal(
+        events: &[(String, Value)],
+        request_id: &str,
+        expected_source: &str,
+    ) {
+        let (event_name, payload) = events.last().expect("error event must exist");
+        assert_eq!(event_name, "error", "last stream event must be error");
+        assert_eq!(
+            payload.get("type").and_then(Value::as_str),
+            Some("error"),
+            "top-level stream payload must be type=error"
+        );
+        let error = payload.get("error").expect("error body must exist");
+        assert_eq!(
+            error.get("source").and_then(Value::as_str),
+            Some(expected_source)
+        );
+        assert_eq!(
+            error.get("request_id").and_then(Value::as_str),
+            Some(request_id)
+        );
+        assert!(
+            error
+                .get("message")
+                .and_then(Value::as_str)
+                .is_some_and(|m| !m.is_empty()),
+            "error.message must be a non-empty string"
+        );
+    }
+
+    async fn spawn_mock_openai_stalled_stream_server() -> (String, MockServer) {
         async fn chat_completions_stream_handler(Json(body): Json<Value>) -> HttpResponse<Body> {
             assert_eq!(
                 body.get("stream").and_then(Value::as_bool),
@@ -2642,7 +2722,7 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
 
-        (format!("http://{}", addr), handle)
+        (format!("http://{}", addr), MockServer(handle))
     }
 
     #[tokio::test]
@@ -2696,18 +2776,17 @@ mod tests {
             !event_names.contains(&"message_stop"),
             "terminal success event must not be emitted on stalled stream"
         );
-        let error_event = events
-            .iter()
-            .find(|(name, _)| name == "error")
-            .expect("error event must exist");
-        let error_payload = error_event.1.get("error").expect("error body must exist");
+        assert_stream_error_is_canonical_and_terminal(&events, &request_id_header, "upstream");
+        let error_payload = events
+            .last()
+            .expect("error event must exist")
+            .1
+            .get("error")
+            .cloned()
+            .expect("error body must exist");
         assert_eq!(
-            error_payload.get("source").and_then(Value::as_str),
-            Some("upstream")
-        );
-        assert_eq!(
-            error_payload.get("request_id").and_then(Value::as_str),
-            Some(request_id_header.as_str())
+            error_payload.get("message").and_then(Value::as_str),
+            Some("Streaming response interrupted")
         );
     }
 
