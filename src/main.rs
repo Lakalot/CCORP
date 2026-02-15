@@ -49,6 +49,8 @@ pub(crate) struct RequestId(pub(crate) String);
 static REQUEST_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 const REQUEST_TIMEOUT_SECS: u64 = 60;
+/// Default stream mode when the `stream` field is omitted: non-streaming.
+const DEFAULT_STREAM_MODE: bool = false;
 
 #[tokio::main]
 async fn main() {
@@ -168,6 +170,9 @@ async fn messages_handler(
         }
     };
 
+    // Resolve stream mode at the request boundary, before translation.
+    let is_stream = resolve_stream_mode(payload.stream);
+
     let settings_guard = state.config.read().await;
     let openai_request =
         match anthropic_to_openai::format_anthropic_to_openai(payload, &settings_guard) {
@@ -199,7 +204,7 @@ async fn messages_handler(
         "dispatching request upstream"
     );
 
-    if openai_request.stream.unwrap_or(false) {
+    if is_stream {
         forward_stream(
             state.client.clone(),
             base_url,
@@ -219,6 +224,10 @@ async fn messages_handler(
         )
         .await
     }
+}
+
+fn resolve_stream_mode(stream: Option<bool>) -> bool {
+    stream.unwrap_or(DEFAULT_STREAM_MODE)
 }
 
 /// Constant-time comparison to prevent timing attacks on API key validation.
@@ -571,12 +580,14 @@ fn stream_error_event(source: ErrorSource, message: &str, request_id: &str) -> S
 
 #[cfg(test)]
 mod tests {
-    use super::{AppState, build_router, next_request_id, redact_sensitive_headers};
+    use super::{
+        AppState, build_router, next_request_id, redact_sensitive_headers, resolve_stream_mode,
+    };
     use crate::config::Config;
     use axum::{
         Json, Router,
         body::Body,
-        http::{HeaderMap, HeaderValue, Request, StatusCode},
+        http::{HeaderMap, HeaderValue, Request, Response as HttpResponse, StatusCode, header},
         response::Response,
         routing::post,
     };
@@ -647,6 +658,21 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         assert!(response.headers().contains_key("x-request-id"));
+    }
+
+    #[test]
+    fn stream_mode_defaults_to_non_stream_when_flag_omitted() {
+        assert!(!resolve_stream_mode(None));
+    }
+
+    #[test]
+    fn stream_mode_uses_explicit_true_flag() {
+        assert!(resolve_stream_mode(Some(true)));
+    }
+
+    #[test]
+    fn stream_mode_uses_explicit_false_flag() {
+        assert!(!resolve_stream_mode(Some(false)));
     }
 
     enum ApiKeyMode {
@@ -1169,6 +1195,183 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn messages_stream_true_routes_to_sse_pipeline() {
+        let (base_url, _server) = spawn_mock_openai_stream_server().await;
+        let app = build_router(test_state_with_base_url(base_url));
+        let payload = r#"{"model":"claude-sonnet-4","stream":true,"messages":[{"role":"user","content":"Hello"}]}"#;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("content-type", "application/json")
+                    .header("x-api-key", "dummy")
+                    .body(Body::from(payload))
+                    .expect("request build should succeed"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("text/event-stream")
+        );
+        assert!(response.headers().contains_key("x-request-id"));
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should be readable");
+        let body_text = String::from_utf8(body.to_vec()).expect("body should be utf8");
+        assert!(body_text.contains("event: content_block_delta"));
+        assert!(body_text.contains("STREAM_OK"));
+        assert!(body_text.contains("event: message_stop"));
+    }
+
+    #[tokio::test]
+    async fn messages_stream_false_routes_to_non_stream_pipeline() {
+        let (base_url, _server) = spawn_mock_openai_server().await;
+        let app = build_router(test_state_with_base_url(base_url));
+        let payload = r#"{"model":"claude-sonnet-4","stream":false,"messages":[{"role":"user","content":"Hello"}]}"#;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("content-type", "application/json")
+                    .header("x-api-key", "dummy")
+                    .body(Body::from(payload))
+                    .expect("request build should succeed"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_ne!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("text/event-stream")
+        );
+        assert!(
+            response.headers().contains_key("x-request-id"),
+            "x-request-id must be present for stream=false path"
+        );
+        let body = parse_json_body(response).await;
+        assert_eq!(body.get("type").and_then(Value::as_str), Some("message"));
+        assert_eq!(body.get("role").and_then(Value::as_str), Some("assistant"));
+    }
+
+    #[tokio::test]
+    async fn messages_invalid_stream_type_returns_local_validation_error() {
+        let app = build_router(test_state());
+        let payload = r#"{"model":"claude-sonnet-4","stream":"yes","messages":[]}"#;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("content-type", "application/json")
+                    .header("x-api-key", "dummy")
+                    .body(Body::from(payload))
+                    .expect("request build should succeed"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let request_id_header = response
+            .headers()
+            .get("x-request-id")
+            .and_then(|value| value.to_str().ok())
+            .expect("x-request-id should be present")
+            .to_string();
+        let body = parse_json_body(response).await;
+        let error = body
+            .get("error")
+            .and_then(Value::as_object)
+            .expect("error envelope should exist");
+        assert_eq!(
+            error.get("source").and_then(Value::as_str),
+            Some("local_validation")
+        );
+        assert_eq!(
+            error.get("message").and_then(Value::as_str),
+            Some("Malformed request payload")
+        );
+        assert_eq!(
+            error.get("request_id").and_then(Value::as_str),
+            Some(request_id_header.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn messages_stream_integer_returns_local_validation_error() {
+        let app = build_router(test_state());
+        let payload = r#"{"model":"claude-sonnet-4","stream":0,"messages":[]}"#;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("content-type", "application/json")
+                    .header("x-api-key", "dummy")
+                    .body(Body::from(payload))
+                    .expect("request build should succeed"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = parse_json_body(response).await;
+        let error = body
+            .get("error")
+            .and_then(Value::as_object)
+            .expect("error envelope should exist");
+        assert_eq!(
+            error.get("source").and_then(Value::as_str),
+            Some("local_validation")
+        );
+    }
+
+    #[tokio::test]
+    async fn messages_stream_string_false_returns_local_validation_error() {
+        let app = build_router(test_state());
+        let payload = r#"{"model":"claude-sonnet-4","stream":"false","messages":[]}"#;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("content-type", "application/json")
+                    .header("x-api-key", "dummy")
+                    .body(Body::from(payload))
+                    .expect("request build should succeed"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = parse_json_body(response).await;
+        let error = body
+            .get("error")
+            .and_then(Value::as_object)
+            .expect("error envelope should exist");
+        assert_eq!(
+            error.get("source").and_then(Value::as_str),
+            Some("local_validation")
+        );
+    }
+
+    #[tokio::test]
     async fn messages_unparseable_upstream_payload_returns_upstream_error() {
         let (base_url, _server) = spawn_mock_openai_invalid_json_server().await;
         let app = build_router(test_state_with_base_url(base_url));
@@ -1303,6 +1506,40 @@ mod tests {
             "/chat/completions",
             post(chat_completions_invalid_json_handler),
         );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener bind should succeed");
+        let addr = listener
+            .local_addr()
+            .expect("listener should have a local address");
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        (format!("http://{}", addr), handle)
+    }
+
+    async fn spawn_mock_openai_stream_server() -> (String, tokio::task::JoinHandle<()>) {
+        async fn chat_completions_stream_handler(Json(body): Json<Value>) -> HttpResponse<Body> {
+            assert_eq!(
+                body.get("stream").and_then(Value::as_bool),
+                Some(true),
+                "upstream request must contain stream: true"
+            );
+            let payload = concat!(
+                "data: {\"id\":\"chatcmpl-stream\",\"model\":\"openai-test-model\",",
+                "\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",",
+                "\"content\":\"STREAM_OK\"},\"finish_reason\":null}]}\n\n",
+                "data: [DONE]\n\n"
+            );
+            HttpResponse::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "text/event-stream")
+                .body(Body::from(payload))
+                .expect("response build should succeed")
+        }
+
+        let app = Router::new().route("/chat/completions", post(chat_completions_stream_handler));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("listener bind should succeed");
