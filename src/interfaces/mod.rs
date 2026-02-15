@@ -11,6 +11,7 @@ pub fn error_response(
     request_id: impl Into<String>,
 ) -> impl IntoResponse {
     let body = ErrorEnvelope {
+        error_type: "error".to_string(),
         error: ErrorBody {
             source,
             message: message.into(),

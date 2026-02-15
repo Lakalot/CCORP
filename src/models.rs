@@ -33,6 +33,12 @@ pub struct AnthropicRequest {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct AnthropicUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct AnthropicResponse {
     pub id: String,
     #[serde(rename = "type")]
@@ -42,6 +48,8 @@ pub struct AnthropicResponse {
     pub stop_reason: String,
     pub stop_sequence: Option<String>,
     pub model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<AnthropicUsage>,
 }
 
 // OpenAI API Structs
@@ -90,10 +98,19 @@ pub struct OpenAIRequest {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct OpenAIUsage {
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct OpenAIResponse {
     pub id: String,
     pub choices: Vec<OpenAIChoice>,
     pub model: String,
+    #[serde(default)]
+    pub usage: Option<OpenAIUsage>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

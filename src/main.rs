@@ -349,20 +349,20 @@ fn forward_stream(
                     if data == "[DONE]" {
                         break;
                     }
-                    if let Ok(stream_res) = serde_json::from_str::<OpenAIStreamResponse>(data) {
-                        let choice = &stream_res.choices[0];
-                        if let Some(content) = &choice.delta.content {
-                            let anthropic_stream_event = json!({
-                                "type": "content_block_delta",
-                                "index": 0,
-                                "delta": {
-                                    "type": "text_delta",
-                                    "text": content
-                                }
-                            });
-                            let sse_event = format!("event: content_block_delta\ndata: {anthropic_stream_event}\n\n");
-                            yield Ok::<_, axum::Error>(sse_event.into_bytes());
-                        }
+                    if let Ok(stream_res) = serde_json::from_str::<OpenAIStreamResponse>(data)
+                        && let Some(choice) = stream_res.choices.first()
+                        && let Some(content) = &choice.delta.content
+                    {
+                        let anthropic_stream_event = json!({
+                            "type": "content_block_delta",
+                            "index": 0,
+                            "delta": {
+                                "type": "text_delta",
+                                "text": content
+                            }
+                        });
+                        let sse_event = format!("event: content_block_delta\ndata: {anthropic_stream_event}\n\n");
+                        yield Ok::<_, axum::Error>(sse_event.into_bytes());
                     }
                 }
             }
@@ -507,9 +507,11 @@ mod tests {
         Json, Router,
         body::Body,
         http::{HeaderMap, HeaderValue, Request, StatusCode},
+        response::Response,
         routing::post,
     };
     use reqwest::Client;
+    use serde_json::Value;
     use serde_json::json;
     use std::sync::Arc;
     use tokio::sync::RwLock;
@@ -599,6 +601,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn messages_local_auth_error_shape_is_stable_and_correlated() {
+        let app = build_router(test_state());
+        let payload = r#"{"model":"claude-sonnet-4","messages":[]}"#;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload))
+                    .expect("request build should succeed"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let request_id_header = response
+            .headers()
+            .get("x-request-id")
+            .and_then(|value| value.to_str().ok())
+            .expect("x-request-id should be present")
+            .to_string();
+        let body = parse_json_body(response).await;
+        assert_eq!(body.as_object().expect("body should be object").len(), 2);
+        assert_eq!(
+            body.get("type").and_then(Value::as_str),
+            Some("error"),
+            "envelope should have top-level type: error"
+        );
+        let error = body
+            .get("error")
+            .and_then(Value::as_object)
+            .expect("error envelope should exist");
+
+        assert_eq!(error.len(), 3);
+        assert_eq!(
+            error.get("source").and_then(Value::as_str),
+            Some("local_auth")
+        );
+        assert_eq!(
+            error.get("request_id").and_then(Value::as_str),
+            Some(request_id_header.as_str())
+        );
+    }
+
+    #[tokio::test]
     async fn messages_invalid_api_key_header_returns_local_validation_error() {
         let app = build_router(test_state());
         let payload = r#"{"model":"claude-sonnet-4","messages":[]}"#;
@@ -654,6 +703,53 @@ mod tests {
         assert!(body_text.contains("\"source\":\"local_validation\""));
         assert!(body_text.contains("\"message\":\"Malformed request payload\""));
         assert!(body_text.contains("\"request_id\":\"req-"));
+    }
+
+    #[tokio::test]
+    async fn messages_local_validation_error_shape_is_stable_and_correlated() {
+        let app = build_router(test_state());
+        let payload = r#"{"model":"claude-sonnet-4","messages":[}"#;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload))
+                    .expect("request build should succeed"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let request_id_header = response
+            .headers()
+            .get("x-request-id")
+            .and_then(|value| value.to_str().ok())
+            .expect("x-request-id should be present")
+            .to_string();
+        let body = parse_json_body(response).await;
+        assert_eq!(body.as_object().expect("body should be object").len(), 2);
+        assert_eq!(
+            body.get("type").and_then(Value::as_str),
+            Some("error"),
+            "envelope should have top-level type: error"
+        );
+        let error = body
+            .get("error")
+            .and_then(Value::as_object)
+            .expect("error envelope should exist");
+
+        assert_eq!(error.len(), 3);
+        assert_eq!(
+            error.get("source").and_then(Value::as_str),
+            Some("local_validation")
+        );
+        assert_eq!(
+            error.get("request_id").and_then(Value::as_str),
+            Some(request_id_header.as_str())
+        );
     }
 
     #[tokio::test]
@@ -738,11 +834,24 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         assert!(response.headers().contains_key("x-request-id"));
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("body should be readable");
-        let body_text = String::from_utf8(body.to_vec()).expect("body should be utf8");
-        assert!(body_text.contains("\"type\":\"message\""));
+        let body = parse_json_body(response).await;
+        assert_eq!(body["type"], "message");
+        assert_eq!(body["role"], "assistant");
+        assert_eq!(body["stop_reason"], "end_turn");
+        assert!(
+            body["id"]
+                .as_str()
+                .expect("id should be a string")
+                .starts_with("msg_"),
+            "response id should start with msg_ prefix"
+        );
+        assert!(body["content"].is_array(), "content should be an array");
+        assert!(body["model"].is_string(), "model should be present");
+        let usage = body
+            .get("usage")
+            .expect("usage should be present in response");
+        assert_eq!(usage["input_tokens"], 10);
+        assert_eq!(usage["output_tokens"], 20);
     }
 
     #[tokio::test]
@@ -814,6 +923,53 @@ mod tests {
         assert!(body_text.contains("\"request_id\":\"req-"));
     }
 
+    #[tokio::test]
+    async fn messages_unparseable_upstream_payload_returns_upstream_error() {
+        let (base_url, _server) = spawn_mock_openai_invalid_json_server().await;
+        let app = build_router(test_state_with_base_url(base_url));
+        let payload =
+            r#"{"model":"claude-sonnet-4","messages":[{"role":"user","content":"Hello"}]}"#;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("content-type", "application/json")
+                    .header("x-api-key", "test-key")
+                    .body(Body::from(payload))
+                    .expect("request build should succeed"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let request_id_header = response
+            .headers()
+            .get("x-request-id")
+            .and_then(|value| value.to_str().ok())
+            .expect("x-request-id should be present")
+            .to_string();
+        let body = parse_json_body(response).await;
+        let error = body
+            .get("error")
+            .and_then(Value::as_object)
+            .expect("error envelope should exist");
+
+        assert_eq!(
+            error.get("source").and_then(Value::as_str),
+            Some("upstream")
+        );
+        assert_eq!(
+            error.get("message").and_then(Value::as_str),
+            Some("Upstream response could not be parsed")
+        );
+        assert_eq!(
+            error.get("request_id").and_then(Value::as_str),
+            Some(request_id_header.as_str())
+        );
+    }
+
     async fn spawn_mock_openai_server() -> (String, tokio::task::JoinHandle<()>) {
         async fn chat_completions_handler() -> (StatusCode, Json<serde_json::Value>) {
             let response = json!({
@@ -826,7 +982,12 @@ mod tests {
                         "role": "assistant",
                         "content": "Hello from upstream"
                     }
-                }]
+                }],
+                "usage": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 20,
+                    "total_tokens": 30
+                }
             });
             (StatusCode::OK, Json(response))
         }
@@ -862,6 +1023,35 @@ mod tests {
         });
 
         (format!("http://{}", addr), handle)
+    }
+
+    async fn spawn_mock_openai_invalid_json_server() -> (String, tokio::task::JoinHandle<()>) {
+        async fn chat_completions_invalid_json_handler() -> (StatusCode, &'static str) {
+            (StatusCode::OK, "this is not json")
+        }
+
+        let app = Router::new().route(
+            "/chat/completions",
+            post(chat_completions_invalid_json_handler),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener bind should succeed");
+        let addr = listener
+            .local_addr()
+            .expect("listener should have a local address");
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        (format!("http://{}", addr), handle)
+    }
+
+    async fn parse_json_body(response: Response) -> Value {
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should be readable");
+        serde_json::from_slice::<Value>(&body).expect("body should be valid json")
     }
 
     fn test_state() -> AppState {
