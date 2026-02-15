@@ -4,7 +4,8 @@ use serde::{Deserialize, Serialize};
 
 use axum::{
     extract::{Json, State},
-    response::{Html, IntoResponse},
+    http::StatusCode,
+    response::{Html, IntoResponse, Response},
 };
 
 #[derive(Deserialize, Serialize)]
@@ -49,15 +50,24 @@ pub async fn switch_model_get(State(state): State<crate::AppState>) -> Html<Stri
     Html(html)
 }
 
-/// POST /switch-model - Save selected models to config.toml
+/// POST /switch-model - Save selected models to config.json
 pub async fn switch_model_post(
     State(state): State<crate::AppState>,
     Json(selection): Json<ModelSelection>,
-) -> impl IntoResponse {
+) -> Response {
     let mut config = state.config.write().await;
     config.model_haiku = selection.haiku;
     config.model_opus = selection.opus;
     config.model_sonnet = selection.sonnet;
-    config.write();
-    "Models updated successfully"
+    match config.write() {
+        Ok(()) => (StatusCode::OK, "Models updated successfully").into_response(),
+        Err(err) => {
+            tracing::error!("Config write failed: {err}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to save configuration: {err}"),
+            )
+                .into_response()
+        }
+    }
 }

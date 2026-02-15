@@ -48,6 +48,11 @@ Create a `.env` file in the root directory with your OpenRouter API key:
 OPENROUTER_API_KEY=your_openrouter_api_key_here
 ```
 
+Startup is explicit and fail-fast:
+- `.env` must provide `OPENROUTER_API_KEY`
+- `config.json` must exist and be valid JSON
+- the process exits immediately on invalid startup configuration
+
 ### Step 2: Model Configuration
 
 Create a `config.json` file to configure the port and model mappings:
@@ -74,6 +79,7 @@ cargo run
 ```
 
 The server will start on `0.0.0.0:3000` (or the port specified in `config.json`).
+Each request gets an `x-request-id` correlation header and baseline middleware hooks for tracing, timeout, and future auth policy insertion.
 
 ### With Request Logging
 
@@ -115,6 +121,13 @@ Visit `http://localhost:3000/switch-model` in your browser to:
 Changes are saved to `config.json` and take effect immediately.
 
 ## Development
+
+### Architecture Direction
+
+The codebase is currently in a mostly flat `src/` layout for delivery speed.
+Target dependency direction is still enforced for upcoming stories:
+`interfaces -> application -> domain -> infrastructure`.
+Story 1.1 prepares this boundary without a broad refactor.
 
 ### Building
 

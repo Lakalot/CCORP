@@ -2,6 +2,7 @@ use dotenvy::dotenv;
 use serde::Deserialize;
 use serde::Serialize;
 use std::env;
+use std::fmt;
 use std::fs;
 
 /// TOML configuration structure
@@ -38,31 +39,44 @@ pub struct Config {
 impl Config {
     /// Load configuration from `config.json` and `.env` file.
     pub fn from_env() -> Self {
-        // Load environment variables from .env file
+        Self::try_from_env().unwrap_or_else(|err| panic!("Configuration error: {err}"))
+    }
+
+    /// Deterministic runtime configuration loading from `.env` and `config.json`.
+    pub fn try_from_env() -> Result<Self, ConfigError> {
         dotenv().ok();
+        let api_key = env::var("OPENROUTER_API_KEY").ok();
+        let config_contents =
+            fs::read_to_string("config.json").map_err(|_| ConfigError::ConfigFileRead)?;
+        Self::try_from_sources(api_key, &config_contents)
+    }
 
-        // Load API key from environment (must be present)
-        let api_key = env::var("OPENROUTER_API_KEY")
-            .expect("Environment variable OPENROUTER_API_KEY must be set");
+    /// Build runtime config from explicit sources. Used by startup and tests.
+    pub(crate) fn try_from_sources(
+        api_key: Option<String>,
+        config_contents: &str,
+    ) -> Result<Self, ConfigError> {
+        let api_key = api_key
+            .map(|key| key.trim().to_string())
+            .filter(|key| !key.is_empty())
+            .ok_or(ConfigError::MissingApiKey)?;
 
-        // Load config.json
-        let config: JsonConfig = serde_json::from_str(
-            &fs::read_to_string("config.json").expect("Could not read config.json file"),
-        )
-        .expect("Could not read config.json file");
+        let config: JsonConfig =
+            serde_json::from_str(config_contents).map_err(|_| ConfigError::ConfigParse)?;
 
-        Config {
+        Ok(Config {
             port: config.port,
             base_url: default_openrouter_base_url(),
             api_key,
             model_haiku: config.models.haiku,
             model_sonnet: config.models.sonnet,
             model_opus: config.models.opus,
-        }
+        })
     }
 
     /// Write configuration to `config.json` (excluding secrets like api_key).
-    pub fn write(&self) {
+    /// Uses atomic write (temp file + rename) to prevent corruption.
+    pub fn write(&self) -> Result<(), ConfigError> {
         let config_out = JsonConfig {
             port: self.port,
             models: ModelConfig {
@@ -73,12 +87,67 @@ impl Config {
         };
 
         let json_string =
-            serde_json::to_string_pretty(&config_out).expect("Failed to serialize configuration");
+            serde_json::to_string_pretty(&config_out).map_err(|_| ConfigError::ConfigSerialize)?;
 
-        fs::write("config.json", json_string).expect("Failed to write config.json");
+        let tmp_path = "config.json.tmp";
+        fs::write(tmp_path, json_string).map_err(|_| ConfigError::ConfigFileWrite)?;
+        fs::rename(tmp_path, "config.json").map_err(|_| ConfigError::ConfigFileWrite)?;
+        Ok(())
     }
 }
 
 fn default_openrouter_base_url() -> String {
     "https://openrouter.ai/api/v1".to_string()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigError {
+    MissingApiKey,
+    ConfigFileRead,
+    ConfigParse,
+    ConfigSerialize,
+    ConfigFileWrite,
+}
+
+impl fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ConfigError::MissingApiKey => {
+                write!(f, "OPENROUTER_API_KEY must be set via .env or environment")
+            }
+            ConfigError::ConfigFileRead => write!(f, "Could not read config.json file"),
+            ConfigError::ConfigParse => write!(f, "Could not parse config.json file"),
+            ConfigError::ConfigSerialize => {
+                write!(f, "Could not serialize configuration")
+            }
+            ConfigError::ConfigFileWrite => write!(f, "Could not write config.json file"),
+        }
+    }
+}
+
+impl std::error::Error for ConfigError {}
+
+#[cfg(test)]
+mod tests {
+    use super::Config;
+
+    #[test]
+    fn rejects_invalid_json_config() {
+        let result = Config::try_from_sources(Some("k".to_string()), "{");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn rejects_missing_api_key() {
+        let config = r#"{"port":3000,"models":{"haiku":"h","sonnet":"s","opus":"o"}}"#;
+        let result = Config::try_from_sources(None, config);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn accepts_valid_sources() {
+        let config = r#"{"port":3000,"models":{"haiku":"h","sonnet":"s","opus":"o"}}"#;
+        let result = Config::try_from_sources(Some("secret".to_string()), config);
+        assert!(result.is_ok());
+    }
 }

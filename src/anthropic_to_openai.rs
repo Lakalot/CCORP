@@ -17,15 +17,15 @@ pub fn map_model(anthropic_model: &str, settings: &Config) -> String {
 pub fn format_anthropic_to_openai(req: AnthropicRequest, settings: &Config) -> OpenAIRequest {
     let mut openapi_messages = Vec::new();
 
-    if let Some(system) = req.system {
-        if let Some(system_str) = system.as_str() {
-            openapi_messages.push(OpenAIMessage {
-                role: "system".to_string(),
-                content: Some(system_str.to_string()),
-                tool_calls: None,
-                tool_call_id: None,
-            });
-        }
+    if let Some(system) = req.system
+        && let Some(system_str) = system.as_str()
+    {
+        openapi_messages.push(OpenAIMessage {
+            role: "system".to_string(),
+            content: Some(system_str.to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+        });
     }
 
     for message in req.messages {
