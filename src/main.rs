@@ -12,7 +12,7 @@ mod switch_model;
 use axum::{
     Extension, Router,
     body::Body,
-    extract::{Json, Request, State},
+    extract::{Json, Request, State, rejection::JsonRejection},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -39,6 +39,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 pub struct AppState {
     pub config: Arc<RwLock<Config>>,
     pub logging_path: Arc<Option<String>>,
+    pub client: Client,
 }
 
 #[derive(Clone, Debug)]
@@ -79,6 +80,7 @@ async fn main() {
     let state = AppState {
         config: Arc::new(RwLock::new(settings)),
         logging_path: Arc::new(logging_path),
+        client: Client::new(),
     };
 
     let app = build_router(state);
@@ -142,206 +144,257 @@ async fn messages_handler(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
     headers: HeaderMap,
-    Json(payload): Json<AnthropicRequest>,
+    payload: Result<Json<AnthropicRequest>, JsonRejection>,
 ) -> Response {
-    let settings_guard = state.config.read().await;
-    let openai_request = anthropic_to_openai::format_anthropic_to_openai(payload, &settings_guard);
-
-    if let Some(path) = state.logging_path.as_ref() {
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_millis();
-        let request_path = format!("{path}/{timestamp}-request.json");
-        if let Ok(request_json) = serde_json::to_string_pretty(&openai_request) {
-            let _ = std::fs::write(request_path, request_json);
-        }
-    }
-    let client = Client::new();
-    let api_key = match headers.get("x-api-key") {
-        None => {
+    let payload = match payload {
+        Ok(Json(payload)) => payload,
+        Err(_) => {
             return error_response(
-                StatusCode::UNAUTHORIZED,
-                ErrorSource::LocalAuth,
-                "Missing x-api-key header",
+                StatusCode::BAD_REQUEST,
+                ErrorSource::LocalValidation,
+                "Malformed request payload",
                 request_id.0,
             )
             .into_response();
         }
-        Some(value) => match value.to_str() {
-            Ok(text) => text.to_string(),
-            Err(_) => {
+    };
+
+    let settings_guard = state.config.read().await;
+    let openai_request =
+        match anthropic_to_openai::format_anthropic_to_openai(payload, &settings_guard) {
+            Ok(request) => request,
+            Err(error) => {
                 return error_response(
                     StatusCode::BAD_REQUEST,
                     ErrorSource::LocalValidation,
-                    "Invalid x-api-key header format",
+                    format!("Invalid Anthropic payload: {}", error.message()),
                     request_id.0,
                 )
                 .into_response();
             }
-        },
-    };
-
-    if openai_request.stream.unwrap_or(false) {
-        let base_url = settings_guard.base_url.clone();
-        let request_id_value = request_id.0.clone();
-        drop(settings_guard);
-        let stream = async_stream::stream! {
-            let res = client
-                .post(format!(
-                    "{base_url}/chat/completions",
-                ))
-                .bearer_auth(api_key)
-                .json(&openai_request)
-                .send()
-                .await;
-
-            let Ok(res) = res else {
-                let event = stream_error_event(
-                    ErrorSource::Upstream,
-                    "Failed to contact upstream provider",
-                    &request_id_value,
-                );
-                yield Ok::<_, axum::Error>(event.into_bytes());
-                return;
-            };
-
-            if !res.status().is_success() {
-                let upstream_body = res.text().await.unwrap_or_default();
-                tracing::error!("OpenRouter request failed: {}", upstream_body);
-                let event = stream_error_event(
-                    ErrorSource::Upstream,
-                    "Upstream provider returned an error",
-                    &request_id_value,
-                );
-                yield Ok::<_, axum::Error>(event.into_bytes());
-                return;
-            }
-
-            let mut stream = res.bytes_stream();
-
-            let mut full_response = String::new();
-            while let Some(item) = stream.next().await {
-                let Ok(chunk) = item else {
-                    let event = stream_error_event(
-                        ErrorSource::Upstream,
-                        "Streaming response interrupted",
-                        &request_id_value,
-                    );
-                    yield Ok::<_, axum::Error>(event.into_bytes());
-                    return;
-                };
-                full_response.push_str(&String::from_utf8_lossy(&chunk));
-                let chunk_str = String::from_utf8_lossy(&chunk);
-                for line in chunk_str.split("
-
-") {
-                    if let Some(data) = line.strip_prefix("data: ") {
-                        if data == "[DONE]" {
-                            break;
-                        }
-                        if let Ok(stream_res) = serde_json::from_str::<OpenAIStreamResponse>(data) {
-                            let choice = &stream_res.choices[0];
-                            if let Some(content) = &choice.delta.content {
-                                let anthropic_stream_event = json!({
-                                    "type": "content_block_delta",
-                                    "index": 0,
-                                    "delta": {
-                                        "type": "text_delta",
-                                        "text": content
-                                    }
-                                });
-                                let sse_event = format!("event: content_block_delta
-data: {anthropic_stream_event}
-
-");
-                                yield Ok::<_, axum::Error>(sse_event.into_bytes());
-                            }
-                        }
-                    }
-                }
-            }
-
-            let message_stop = json!({
-                "type": "message_stop"
-            });
-            let sse_event = format!("event: message_stop
-data: {message_stop}
-
-");
-            yield Ok::<_, axum::Error>(sse_event.into_bytes());
-
-            if let Some(path) = state.logging_path.as_ref() {
-                let timestamp = std::time::SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_millis();
-                let response_path = format!("{path}/{timestamp}-response.json");
-                let _ = std::fs::write(response_path, full_response);
-            }
         };
 
-        let body = Body::from_stream(stream);
+    if let Ok(request_json) = serde_json::to_string_pretty(&openai_request) {
+        log_payload(&state.logging_path, "request", &request_json);
+    }
 
-        Response::builder()
-            .header(header::CONTENT_TYPE, "text/event-stream")
-            .body(body)
-            .unwrap()
+    let api_key = match extract_api_key(&headers, &request_id.0) {
+        Ok(key) => key,
+        Err(response) => return *response,
+    };
+
+    let base_url = settings_guard.base_url.clone();
+    drop(settings_guard);
+
+    if openai_request.stream.unwrap_or(false) {
+        forward_stream(
+            state.client.clone(),
+            base_url,
+            api_key,
+            openai_request,
+            Arc::clone(&state.logging_path),
+            request_id.0,
+        )
     } else {
+        forward_non_stream(
+            &state.client,
+            &base_url,
+            &api_key,
+            &openai_request,
+            &state.logging_path,
+            request_id.0,
+        )
+        .await
+    }
+}
+
+fn extract_api_key(headers: &HeaderMap, request_id: &str) -> Result<String, Box<Response>> {
+    match headers.get("x-api-key") {
+        None => Err(Box::new(
+            error_response(
+                StatusCode::UNAUTHORIZED,
+                ErrorSource::LocalAuth,
+                "Missing x-api-key header",
+                request_id,
+            )
+            .into_response(),
+        )),
+        Some(value) => match value.to_str() {
+            Ok(text) => Ok(text.to_string()),
+            Err(_) => Err(Box::new(
+                error_response(
+                    StatusCode::BAD_REQUEST,
+                    ErrorSource::LocalValidation,
+                    "Invalid x-api-key header format",
+                    request_id,
+                )
+                .into_response(),
+            )),
+        },
+    }
+}
+
+async fn forward_non_stream(
+    client: &Client,
+    base_url: &str,
+    api_key: &str,
+    openai_request: &models::OpenAIRequest,
+    logging_path: &Option<String>,
+    request_id: String,
+) -> Response {
+    let res = client
+        .post(format!("{base_url}/chat/completions"))
+        .bearer_auth(api_key)
+        .json(openai_request)
+        .send()
+        .await;
+
+    let Ok(res) = res else {
+        return error_response(
+            StatusCode::BAD_GATEWAY,
+            ErrorSource::Upstream,
+            "Failed to contact upstream provider",
+            request_id,
+        )
+        .into_response();
+    };
+
+    if !res.status().is_success() {
+        return error_response(
+            StatusCode::BAD_GATEWAY,
+            ErrorSource::Upstream,
+            "Upstream provider returned an error",
+            request_id,
+        )
+        .into_response();
+    }
+
+    let openai_response: models::OpenAIResponse = match res.json().await {
+        Ok(response) => response,
+        Err(_) => {
+            return error_response(
+                StatusCode::BAD_GATEWAY,
+                ErrorSource::Upstream,
+                "Upstream response could not be parsed",
+                request_id,
+            )
+            .into_response();
+        }
+    };
+    let anthropic_response =
+        openai_to_anthropic::format_openai_to_anthropic(openai_response.clone());
+
+    if let Ok(response_json) = serde_json::to_string_pretty(&anthropic_response) {
+        log_payload(logging_path, "response", &response_json);
+    }
+
+    (StatusCode::OK, Json(anthropic_response)).into_response()
+}
+
+fn forward_stream(
+    client: Client,
+    base_url: String,
+    api_key: String,
+    openai_request: models::OpenAIRequest,
+    logging_path: Arc<Option<String>>,
+    request_id: String,
+) -> Response {
+    let stream = async_stream::stream! {
         let res = client
-            .post(format!("{}/chat/completions", settings_guard.base_url))
-            .bearer_auth(api_key)
+            .post(format!("{base_url}/chat/completions"))
+            .bearer_auth(&api_key)
             .json(&openai_request)
             .send()
             .await;
 
         let Ok(res) = res else {
-            return error_response(
-                StatusCode::BAD_GATEWAY,
+            let event = stream_error_event(
                 ErrorSource::Upstream,
                 "Failed to contact upstream provider",
-                request_id.0,
-            )
-            .into_response();
+                &request_id,
+            );
+            yield Ok::<_, axum::Error>(event.into_bytes());
+            return;
         };
 
         if !res.status().is_success() {
-            return error_response(
-                StatusCode::BAD_GATEWAY,
+            let upstream_body = res.text().await.unwrap_or_default();
+            tracing::error!("OpenRouter request failed: {}", upstream_body);
+            let event = stream_error_event(
                 ErrorSource::Upstream,
                 "Upstream provider returned an error",
-                request_id.0,
-            )
-            .into_response();
+                &request_id,
+            );
+            yield Ok::<_, axum::Error>(event.into_bytes());
+            return;
         }
 
-        let openai_response: models::OpenAIResponse = match res.json().await {
-            Ok(response) => response,
-            Err(_) => {
-                return error_response(
-                    StatusCode::BAD_GATEWAY,
+        let mut byte_stream = res.bytes_stream();
+
+        let mut full_response = String::new();
+        while let Some(item) = byte_stream.next().await {
+            let Ok(chunk) = item else {
+                let event = stream_error_event(
                     ErrorSource::Upstream,
-                    "Upstream response could not be parsed",
-                    request_id.0,
-                )
-                .into_response();
-            }
-        };
-        let anthropic_response =
-            openai_to_anthropic::format_openai_to_anthropic(openai_response.clone());
-
-        if let Some(path) = state.logging_path.as_ref() {
-            let timestamp = std::time::SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_millis();
-            let response_path = format!("{path}/{timestamp}-response.json");
-            if let Ok(response_json) = serde_json::to_string_pretty(&anthropic_response) {
-                let _ = std::fs::write(response_path, response_json);
+                    "Streaming response interrupted",
+                    &request_id,
+                );
+                yield Ok::<_, axum::Error>(event.into_bytes());
+                return;
+            };
+            full_response.push_str(&String::from_utf8_lossy(&chunk));
+            let chunk_str = String::from_utf8_lossy(&chunk);
+            for line in chunk_str.split("\n\n") {
+                if let Some(data) = line.strip_prefix("data: ") {
+                    if data == "[DONE]" {
+                        break;
+                    }
+                    if let Ok(stream_res) = serde_json::from_str::<OpenAIStreamResponse>(data) {
+                        let choice = &stream_res.choices[0];
+                        if let Some(content) = &choice.delta.content {
+                            let anthropic_stream_event = json!({
+                                "type": "content_block_delta",
+                                "index": 0,
+                                "delta": {
+                                    "type": "text_delta",
+                                    "text": content
+                                }
+                            });
+                            let sse_event = format!("event: content_block_delta\ndata: {anthropic_stream_event}\n\n");
+                            yield Ok::<_, axum::Error>(sse_event.into_bytes());
+                        }
+                    }
+                }
             }
         }
 
-        (StatusCode::OK, Json(anthropic_response)).into_response()
+        let message_stop = json!({
+            "type": "message_stop"
+        });
+        let sse_event = format!("event: message_stop\ndata: {message_stop}\n\n");
+        yield Ok::<_, axum::Error>(sse_event.into_bytes());
+
+        if let Ok(response_json) = serde_json::to_string_pretty(&full_response) {
+            log_payload(&logging_path, "response", &response_json);
+        }
+    };
+
+    let body = Body::from_stream(stream);
+
+    Response::builder()
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .body(body)
+        .unwrap()
+}
+
+fn log_payload(logging_path: &Option<String>, suffix: &str, content: &str) {
+    if let Some(dir) = logging_path.as_ref() {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let file_path = format!("{dir}/{timestamp}-{suffix}.json");
+        let _ = std::fs::write(file_path, content);
     }
 }
 
@@ -366,8 +419,13 @@ async fn trace_middleware(request: Request, next: Next) -> Response {
         .get::<RequestId>()
         .map(|value| value.0.clone())
         .unwrap_or_else(|| "unknown".to_string());
+    let anthropic_version = request
+        .headers()
+        .get("anthropic-version")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("none");
     let headers = redact_sensitive_headers(request.headers());
-    tracing::info!(%request_id, %method, %path, ?headers, "incoming request");
+    tracing::info!(%request_id, %method, %path, %anthropic_version, ?headers, "incoming request");
 
     let response = next.run(request).await;
     tracing::info!(
@@ -446,9 +504,13 @@ mod tests {
     use super::{AppState, build_router, next_request_id, redact_sensitive_headers};
     use crate::config::Config;
     use axum::{
+        Json, Router,
         body::Body,
         http::{HeaderMap, HeaderValue, Request, StatusCode},
+        routing::post,
     };
+    use reqwest::Client;
+    use serde_json::json;
     use std::sync::Arc;
     use tokio::sync::RwLock;
     use tower::util::ServiceExt;
@@ -463,6 +525,8 @@ mod tests {
     fn sensitive_headers_are_redacted() {
         let mut headers = HeaderMap::new();
         headers.insert("x-api-key", HeaderValue::from_static("secret"));
+        headers.insert("authorization", HeaderValue::from_static("Bearer secret"));
+        headers.insert("cookie", HeaderValue::from_static("session=secret"));
         headers.insert("x-normal-header", HeaderValue::from_static("visible"));
 
         let redacted = redact_sensitive_headers(&headers);
@@ -476,6 +540,16 @@ mod tests {
             redacted
                 .iter()
                 .any(|(name, value)| name == "x-normal-header" && value == "visible")
+        );
+        assert!(
+            redacted
+                .iter()
+                .any(|(name, value)| name == "authorization" && value == "<redacted>")
+        );
+        assert!(
+            redacted
+                .iter()
+                .any(|(name, value)| name == "cookie" && value == "<redacted>")
         );
     }
 
@@ -515,6 +589,7 @@ mod tests {
             .expect("request should complete");
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(response.headers().contains_key("x-request-id"));
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .expect("body should be readable");
@@ -523,10 +598,280 @@ mod tests {
         assert!(body_text.contains("\"request_id\":\"req-"));
     }
 
+    #[tokio::test]
+    async fn messages_invalid_api_key_header_returns_local_validation_error() {
+        let app = build_router(test_state());
+        let payload = r#"{"model":"claude-sonnet-4","messages":[]}"#;
+        let invalid_header = HeaderValue::from_bytes(&[0x80]).expect("header value should build");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("content-type", "application/json")
+                    .header("x-api-key", invalid_header)
+                    .body(Body::from(payload))
+                    .expect("request build should succeed"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(response.headers().contains_key("x-request-id"));
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should be readable");
+        let body_text = String::from_utf8(body.to_vec()).expect("body should be utf8");
+        assert!(body_text.contains("\"source\":\"local_validation\""));
+        assert!(body_text.contains("\"message\":\"Invalid x-api-key header format\""));
+        assert!(body_text.contains("\"request_id\":\"req-"));
+    }
+
+    #[tokio::test]
+    async fn messages_invalid_json_returns_local_validation_error() {
+        let app = build_router(test_state());
+        let payload = r#"{"model":"claude-sonnet-4","messages":[}"#;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload))
+                    .expect("request build should succeed"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(response.headers().contains_key("x-request-id"));
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should be readable");
+        let body_text = String::from_utf8(body.to_vec()).expect("body should be utf8");
+        assert!(body_text.contains("\"source\":\"local_validation\""));
+        assert!(body_text.contains("\"message\":\"Malformed request payload\""));
+        assert!(body_text.contains("\"request_id\":\"req-"));
+    }
+
+    #[tokio::test]
+    async fn messages_missing_required_fields_returns_local_validation_error() {
+        let app = build_router(test_state());
+        let payload = r#"{"messages":[]}"#;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload))
+                    .expect("request build should succeed"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(response.headers().contains_key("x-request-id"));
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should be readable");
+        let body_text = String::from_utf8(body.to_vec()).expect("body should be utf8");
+        assert!(body_text.contains("\"source\":\"local_validation\""));
+        assert!(body_text.contains("\"message\":\"Malformed request payload\""));
+        assert!(body_text.contains("\"request_id\":\"req-"));
+    }
+
+    #[tokio::test]
+    async fn messages_unknown_block_returns_local_validation_error() {
+        let app = build_router(test_state());
+        let payload = r#"{
+            "model":"claude-sonnet-4",
+            "messages":[{"role":"user","content":[{"type":"unknown_block","foo":"bar"}]}]
+        }"#;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("content-type", "application/json")
+                    .header("x-api-key", "test-key")
+                    .body(Body::from(payload))
+                    .expect("request build should succeed"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(response.headers().contains_key("x-request-id"));
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should be readable");
+        let body_text = String::from_utf8(body.to_vec()).expect("body should be utf8");
+        assert!(body_text.contains("\"source\":\"local_validation\""));
+        assert!(body_text.contains("\"message\":\"Invalid Anthropic payload: Unsupported user content block type: unknown_block\""));
+        assert!(body_text.contains("\"request_id\":\"req-"));
+    }
+
+    #[tokio::test]
+    async fn messages_valid_minimal_payload_translates_and_returns_ok() {
+        let (base_url, _server) = spawn_mock_openai_server().await;
+        let app = build_router(test_state_with_base_url(base_url));
+        let payload =
+            r#"{"model":"claude-sonnet-4","messages":[{"role":"user","content":"Hello"}]}"#;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("content-type", "application/json")
+                    .header("x-api-key", "test-key")
+                    .body(Body::from(payload))
+                    .expect("request build should succeed"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers().contains_key("x-request-id"));
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should be readable");
+        let body_text = String::from_utf8(body.to_vec()).expect("body should be utf8");
+        assert!(body_text.contains("\"type\":\"message\""));
+    }
+
+    #[tokio::test]
+    async fn messages_upstream_connectivity_failure_returns_upstream_error() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener bind should succeed");
+        let addr = listener
+            .local_addr()
+            .expect("listener should have a local address");
+        drop(listener);
+
+        let app = build_router(test_state_with_base_url(format!("http://{}", addr)));
+        let payload =
+            r#"{"model":"claude-sonnet-4","messages":[{"role":"user","content":"Hello"}]}"#;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("content-type", "application/json")
+                    .header("x-api-key", "test-key")
+                    .body(Body::from(payload))
+                    .expect("request build should succeed"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert!(response.headers().contains_key("x-request-id"));
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should be readable");
+        let body_text = String::from_utf8(body.to_vec()).expect("body should be utf8");
+        assert!(body_text.contains("\"source\":\"upstream\""));
+        assert!(body_text.contains("\"message\":\"Failed to contact upstream provider\""));
+        assert!(body_text.contains("\"request_id\":\"req-"));
+    }
+
+    #[tokio::test]
+    async fn messages_upstream_http_error_returns_upstream_error() {
+        let (base_url, _server) = spawn_mock_openai_error_server().await;
+        let app = build_router(test_state_with_base_url(base_url));
+        let payload =
+            r#"{"model":"claude-sonnet-4","messages":[{"role":"user","content":"Hello"}]}"#;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("content-type", "application/json")
+                    .header("x-api-key", "test-key")
+                    .body(Body::from(payload))
+                    .expect("request build should succeed"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert!(response.headers().contains_key("x-request-id"));
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should be readable");
+        let body_text = String::from_utf8(body.to_vec()).expect("body should be utf8");
+        assert!(body_text.contains("\"source\":\"upstream\""));
+        assert!(body_text.contains("\"message\":\"Upstream provider returned an error\""));
+        assert!(body_text.contains("\"request_id\":\"req-"));
+    }
+
+    async fn spawn_mock_openai_server() -> (String, tokio::task::JoinHandle<()>) {
+        async fn chat_completions_handler() -> (StatusCode, Json<serde_json::Value>) {
+            let response = json!({
+                "id": "chatcmpl-test",
+                "model": "openai-test-model",
+                "choices": [{
+                    "index": 0,
+                    "finish_reason": "stop",
+                    "message": {
+                        "role": "assistant",
+                        "content": "Hello from upstream"
+                    }
+                }]
+            });
+            (StatusCode::OK, Json(response))
+        }
+
+        let app = Router::new().route("/chat/completions", post(chat_completions_handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener bind should succeed");
+        let addr = listener
+            .local_addr()
+            .expect("listener should have a local address");
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        (format!("http://{}", addr), handle)
+    }
+
+    async fn spawn_mock_openai_error_server() -> (String, tokio::task::JoinHandle<()>) {
+        async fn chat_completions_error_handler() -> (StatusCode, &'static str) {
+            (StatusCode::INTERNAL_SERVER_ERROR, "boom")
+        }
+
+        let app = Router::new().route("/chat/completions", post(chat_completions_error_handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener bind should succeed");
+        let addr = listener
+            .local_addr()
+            .expect("listener should have a local address");
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        (format!("http://{}", addr), handle)
+    }
+
     fn test_state() -> AppState {
+        test_state_with_base_url("https://openrouter.ai/api/v1".to_string())
+    }
+
+    fn test_state_with_base_url(base_url: String) -> AppState {
         let config = Config {
             port: 3332,
-            base_url: "https://openrouter.ai/api/v1".to_string(),
+            base_url,
             api_key: "dummy".to_string(),
             model_haiku: "haiku".to_string(),
             model_sonnet: "sonnet".to_string(),
@@ -535,6 +880,7 @@ mod tests {
         AppState {
             config: Arc::new(RwLock::new(config)),
             logging_path: Arc::new(None),
+            client: Client::new(),
         }
     }
 }
