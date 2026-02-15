@@ -28,6 +28,8 @@ pub struct Config {
     pub base_url: String,
     /// API key for authenticating with OpenRouter
     pub api_key: String,
+    /// API key for authenticating inbound client requests (CCORP_API_KEY, falls back to api_key)
+    pub inbound_api_key: String,
     /// Override model name for Claude 3.5 Haiku
     pub model_haiku: String,
     /// Override model name for Claude Sonnet 4
@@ -46,20 +48,27 @@ impl Config {
     pub fn try_from_env() -> Result<Self, ConfigError> {
         dotenv().ok();
         let api_key = env::var("OPENROUTER_API_KEY").ok();
+        let inbound_api_key = env::var("CCORP_API_KEY").ok();
         let config_contents =
             fs::read_to_string("config.json").map_err(|_| ConfigError::ConfigFileRead)?;
-        Self::try_from_sources(api_key, &config_contents)
+        Self::try_from_sources(api_key, inbound_api_key, &config_contents)
     }
 
     /// Build runtime config from explicit sources. Used by startup and tests.
     pub(crate) fn try_from_sources(
         api_key: Option<String>,
+        inbound_api_key: Option<String>,
         config_contents: &str,
     ) -> Result<Self, ConfigError> {
         let api_key = api_key
             .map(|key| key.trim().to_string())
             .filter(|key| !key.is_empty())
             .ok_or(ConfigError::MissingApiKey)?;
+
+        let inbound_api_key = inbound_api_key
+            .map(|key| key.trim().to_string())
+            .filter(|key| !key.is_empty())
+            .unwrap_or_else(|| api_key.clone());
 
         let config: JsonConfig =
             serde_json::from_str(config_contents).map_err(|_| ConfigError::ConfigParse)?;
@@ -68,6 +77,7 @@ impl Config {
             port: config.port,
             base_url: default_openrouter_base_url(),
             api_key,
+            inbound_api_key,
             model_haiku: config.models.haiku,
             model_sonnet: config.models.sonnet,
             model_opus: config.models.opus,
@@ -129,25 +139,59 @@ impl std::error::Error for ConfigError {}
 
 #[cfg(test)]
 mod tests {
-    use super::Config;
+    use super::{Config, ConfigError};
 
     #[test]
     fn rejects_invalid_json_config() {
-        let result = Config::try_from_sources(Some("k".to_string()), "{");
+        let result = Config::try_from_sources(Some("k".to_string()), None, "{");
         assert!(result.is_err());
     }
 
     #[test]
     fn rejects_missing_api_key() {
         let config = r#"{"port":3000,"models":{"haiku":"h","sonnet":"s","opus":"o"}}"#;
-        let result = Config::try_from_sources(None, config);
+        let result = Config::try_from_sources(None, None, config);
         assert!(result.is_err());
     }
 
     #[test]
     fn accepts_valid_sources() {
         let config = r#"{"port":3000,"models":{"haiku":"h","sonnet":"s","opus":"o"}}"#;
-        let result = Config::try_from_sources(Some("secret".to_string()), config);
+        let result = Config::try_from_sources(Some("secret".to_string()), None, config);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn startup_smoke_accepts_minimal_required_sources() {
+        let config = r#"{"port":3000,"models":{"haiku":"h","sonnet":"s","opus":"o"}}"#;
+        let loaded = Config::try_from_sources(Some("secret".to_string()), None, config)
+            .expect("minimal startup configuration should load");
+        assert_eq!(loaded.port, 3000);
+        assert_eq!(loaded.base_url, "https://openrouter.ai/api/v1");
+        assert_eq!(loaded.api_key, "secret");
+        assert_eq!(
+            loaded.inbound_api_key, "secret",
+            "CCORP_API_KEY should default to OPENROUTER_API_KEY when omitted"
+        );
+    }
+
+    #[test]
+    fn startup_smoke_missing_api_key_fails_fast_with_actionable_diagnostic() {
+        let config = r#"{"port":3000,"models":{"haiku":"h","sonnet":"s","opus":"o"}}"#;
+        let error = Config::try_from_sources(None, None, config)
+            .expect_err("startup should fail fast when OPENROUTER_API_KEY is absent");
+        assert_eq!(error, ConfigError::MissingApiKey);
+        assert!(
+            error.to_string().contains("OPENROUTER_API_KEY"),
+            "diagnostic should explain which environment variable is required"
+        );
+    }
+
+    #[test]
+    fn startup_smoke_invalid_config_fails_fast_with_actionable_diagnostic() {
+        let error = Config::try_from_sources(Some("secret".to_string()), None, "{")
+            .expect_err("startup should fail fast on malformed config.json");
+        assert_eq!(error, ConfigError::ConfigParse);
+        assert_eq!(error.to_string(), "Could not parse config.json file");
     }
 }

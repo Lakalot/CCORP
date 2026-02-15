@@ -40,10 +40,11 @@ pub struct AppState {
     pub config: Arc<RwLock<Config>>,
     pub logging_path: Arc<Option<String>>,
     pub client: Client,
+    pub inbound_api_key: Arc<String>,
 }
 
 #[derive(Clone, Debug)]
-struct RequestId(String);
+pub(crate) struct RequestId(pub(crate) String);
 
 static REQUEST_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -77,10 +78,16 @@ async fn main() {
 
     let addr = std::net::SocketAddr::from(([0, 0, 0, 0], settings.port));
 
+    let inbound_key = settings.inbound_api_key.clone();
+    let client = Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .build()
+        .expect("HTTP client should build");
     let state = AppState {
         config: Arc::new(RwLock::new(settings)),
         logging_path: Arc::new(logging_path),
-        client: Client::new(),
+        client,
+        inbound_api_key: Arc::new(inbound_key),
     };
 
     let app = build_router(state);
@@ -134,7 +141,10 @@ fn build_router(state: AppState) -> Router {
             get(switch_model::switch_model_get).post(switch_model::switch_model_post),
         )
         .layer(middleware::from_fn(timeout_middleware))
-        .layer(middleware::from_fn(auth_placeholder_middleware))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ))
         .layer(middleware::from_fn(trace_middleware))
         .layer(middleware::from_fn(request_id_middleware))
         .with_state(state)
@@ -143,7 +153,6 @@ fn build_router(state: AppState) -> Router {
 async fn messages_handler(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
-    headers: HeaderMap,
     payload: Result<Json<AnthropicRequest>, JsonRejection>,
 ) -> Response {
     let payload = match payload {
@@ -178,19 +187,23 @@ async fn messages_handler(
         log_payload(&state.logging_path, "request", &request_json);
     }
 
-    let api_key = match extract_api_key(&headers, &request_id.0) {
-        Ok(key) => key,
-        Err(response) => return *response,
-    };
-
     let base_url = settings_guard.base_url.clone();
+    let upstream_api_key = settings_guard.api_key.clone();
     drop(settings_guard);
+
+    tracing::info!(
+        request_id = %request_id.0,
+        route = "/v1/messages",
+        provider = "openrouter",
+        model = %openai_request.model,
+        "dispatching request upstream"
+    );
 
     if openai_request.stream.unwrap_or(false) {
         forward_stream(
             state.client.clone(),
             base_url,
-            api_key,
+            upstream_api_key,
             openai_request,
             Arc::clone(&state.logging_path),
             request_id.0,
@@ -199,7 +212,7 @@ async fn messages_handler(
         forward_non_stream(
             &state.client,
             &base_url,
-            &api_key,
+            &upstream_api_key,
             &openai_request,
             &state.logging_path,
             request_id.0,
@@ -208,7 +221,25 @@ async fn messages_handler(
     }
 }
 
-fn extract_api_key(headers: &HeaderMap, request_id: &str) -> Result<String, Box<Response>> {
+/// Constant-time comparison to prevent timing attacks on API key validation.
+/// Iterates over the longer input to avoid leaking expected key length.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    let max_len = a.len().max(b.len());
+    let len_mismatch = if a.len() == b.len() { 0u8 } else { 1u8 };
+    let mut acc = 0u8;
+    for i in 0..max_len {
+        let byte_a = a.get(i).copied().unwrap_or(0);
+        let byte_b = b.get(i).copied().unwrap_or(0);
+        acc |= byte_a ^ byte_b;
+    }
+    (acc | len_mismatch) == 0
+}
+
+fn validate_inbound_api_key(
+    headers: &HeaderMap,
+    expected_api_key: &str,
+    request_id: &str,
+) -> Result<(), Box<Response>> {
     match headers.get("x-api-key") {
         None => Err(Box::new(
             error_response(
@@ -220,12 +251,26 @@ fn extract_api_key(headers: &HeaderMap, request_id: &str) -> Result<String, Box<
             .into_response(),
         )),
         Some(value) => match value.to_str() {
-            Ok(text) => Ok(text.to_string()),
+            Ok(text)
+                if !text.is_empty()
+                    && constant_time_eq(text.as_bytes(), expected_api_key.as_bytes()) =>
+            {
+                Ok(())
+            }
             Err(_) => Err(Box::new(
                 error_response(
-                    StatusCode::BAD_REQUEST,
-                    ErrorSource::LocalValidation,
-                    "Invalid x-api-key header format",
+                    StatusCode::UNAUTHORIZED,
+                    ErrorSource::LocalAuth,
+                    "Invalid x-api-key",
+                    request_id,
+                )
+                .into_response(),
+            )),
+            Ok(_) => Err(Box::new(
+                error_response(
+                    StatusCode::UNAUTHORIZED,
+                    ErrorSource::LocalAuth,
+                    "Invalid x-api-key",
                     request_id,
                 )
                 .into_response(),
@@ -454,8 +499,23 @@ async fn timeout_middleware(request: Request, next: Next) -> Response {
     }
 }
 
-async fn auth_placeholder_middleware(request: Request, next: Next) -> Response {
-    // Reserved insertion point for Story 1.4 x-api-key enforcement policy.
+async fn auth_middleware(State(state): State<AppState>, request: Request, next: Next) -> Response {
+    let requires_auth = matches!(request.uri().path(), "/v1/messages" | "/switch-model");
+
+    if requires_auth {
+        let request_id = request
+            .extensions()
+            .get::<RequestId>()
+            .map(|value| value.0.clone())
+            .unwrap_or_else(|| "unknown".to_string());
+
+        if let Err(response) =
+            validate_inbound_api_key(request.headers(), &state.inbound_api_key, &request_id)
+        {
+            return *response;
+        }
+    }
+
     next.run(request).await
 }
 
@@ -473,10 +533,7 @@ fn redact_sensitive_headers(headers: &HeaderMap) -> Vec<(String, String)> {
         .iter()
         .map(|(name, value)| {
             let lower_name = name.as_str().to_ascii_lowercase();
-            let redacted = matches!(
-                lower_name.as_str(),
-                "authorization" | "x-api-key" | "proxy-authorization" | "cookie" | "set-cookie"
-            );
+            let redacted = is_sensitive_header_name(&lower_name);
             let display_value = if redacted {
                 "<redacted>".to_string()
             } else {
@@ -485,6 +542,19 @@ fn redact_sensitive_headers(headers: &HeaderMap) -> Vec<(String, String)> {
             (name.to_string(), display_value)
         })
         .collect()
+}
+
+fn is_sensitive_header_name(lower_name: &str) -> bool {
+    matches!(
+        lower_name,
+        "authorization" | "x-api-key" | "proxy-authorization" | "cookie" | "set-cookie"
+    ) || lower_name.contains("secret")
+        || lower_name.contains("password")
+        || lower_name.contains("credential")
+        || (lower_name.contains("token") && !lower_name.contains("ratelimit"))
+        || (lower_name.ends_with("-key")
+            && !lower_name.contains("idempotency")
+            && !lower_name.contains("cache"))
 }
 
 fn stream_error_event(source: ErrorSource, message: &str, request_id: &str) -> String {
@@ -513,8 +583,8 @@ mod tests {
     use reqwest::Client;
     use serde_json::Value;
     use serde_json::json;
-    use std::sync::Arc;
-    use tokio::sync::RwLock;
+    use std::{sync::Arc, time::Duration};
+    use tokio::sync::{RwLock, oneshot};
     use tower::util::ServiceExt;
 
     #[test]
@@ -528,6 +598,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("x-api-key", HeaderValue::from_static("secret"));
         headers.insert("authorization", HeaderValue::from_static("Bearer secret"));
+        headers.insert("x-auth-token", HeaderValue::from_static("abc123"));
         headers.insert("cookie", HeaderValue::from_static("session=secret"));
         headers.insert("x-normal-header", HeaderValue::from_static("visible"));
 
@@ -547,6 +618,11 @@ mod tests {
             redacted
                 .iter()
                 .any(|(name, value)| name == "authorization" && value == "<redacted>")
+        );
+        assert!(
+            redacted
+                .iter()
+                .any(|(name, value)| name == "x-auth-token" && value == "<redacted>")
         );
         assert!(
             redacted
@@ -573,31 +649,265 @@ mod tests {
         assert!(response.headers().contains_key("x-request-id"));
     }
 
+    enum ApiKeyMode {
+        Missing,
+        Plain(&'static str),
+    }
+
+    enum UpstreamMode {
+        None,
+        Success,
+        ConnectivityFailure,
+        HttpFailure,
+    }
+
+    struct ContractCase {
+        name: &'static str,
+        payload: &'static str,
+        api_key: ApiKeyMode,
+        upstream_mode: UpstreamMode,
+        expected_status: StatusCode,
+        expected_source: Option<&'static str>,
+        expected_message: Option<&'static str>,
+    }
+
     #[tokio::test]
-    async fn messages_missing_api_key_returns_local_auth_error() {
+    async fn epic1_contract_matrix_is_table_driven_and_correlated() {
+        let cases = vec![
+            ContractCase {
+                name: "non_stream_happy_path",
+                payload: r#"{"model":"claude-sonnet-4","messages":[{"role":"user","content":"Hello"}]}"#,
+                api_key: ApiKeyMode::Plain("dummy"),
+                upstream_mode: UpstreamMode::Success,
+                expected_status: StatusCode::OK,
+                expected_source: None,
+                expected_message: None,
+            },
+            ContractCase {
+                name: "missing_key",
+                payload: r#"{"model":"claude-sonnet-4","messages":[]}"#,
+                api_key: ApiKeyMode::Missing,
+                upstream_mode: UpstreamMode::None,
+                expected_status: StatusCode::UNAUTHORIZED,
+                expected_source: Some("local_auth"),
+                expected_message: Some("Missing x-api-key header"),
+            },
+            ContractCase {
+                name: "invalid_key",
+                payload: r#"{"model":"claude-sonnet-4","messages":[]}"#,
+                api_key: ApiKeyMode::Plain("wrong-key"),
+                upstream_mode: UpstreamMode::None,
+                expected_status: StatusCode::UNAUTHORIZED,
+                expected_source: Some("local_auth"),
+                expected_message: Some("Invalid x-api-key"),
+            },
+            ContractCase {
+                name: "malformed_payload",
+                payload: r#"{"model":"claude-sonnet-4","messages":[}"#,
+                api_key: ApiKeyMode::Plain("dummy"),
+                upstream_mode: UpstreamMode::None,
+                expected_status: StatusCode::BAD_REQUEST,
+                expected_source: Some("local_validation"),
+                expected_message: Some("Malformed request payload"),
+            },
+            ContractCase {
+                name: "upstream_connectivity_failure_mapping",
+                payload: r#"{"model":"claude-sonnet-4","messages":[{"role":"user","content":"Hello"}]}"#,
+                api_key: ApiKeyMode::Plain("dummy"),
+                upstream_mode: UpstreamMode::ConnectivityFailure,
+                expected_status: StatusCode::BAD_GATEWAY,
+                expected_source: Some("upstream"),
+                expected_message: Some("Failed to contact upstream provider"),
+            },
+            ContractCase {
+                name: "upstream_http_failure_mapping",
+                payload: r#"{"model":"claude-sonnet-4","messages":[{"role":"user","content":"Hello"}]}"#,
+                api_key: ApiKeyMode::Plain("dummy"),
+                upstream_mode: UpstreamMode::HttpFailure,
+                expected_status: StatusCode::BAD_GATEWAY,
+                expected_source: Some("upstream"),
+                expected_message: Some("Upstream provider returned an error"),
+            },
+        ];
+
+        for case in cases {
+            let mut mock_handle: Option<tokio::task::JoinHandle<()>> = None;
+            let app = match case.upstream_mode {
+                UpstreamMode::None => build_router(test_state()),
+                UpstreamMode::Success => {
+                    let (base_url, handle) = spawn_mock_openai_server().await;
+                    mock_handle = Some(handle);
+                    build_router(test_state_with_base_url(base_url))
+                }
+                UpstreamMode::ConnectivityFailure => {
+                    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                        .await
+                        .expect("listener bind should succeed");
+                    let addr = listener
+                        .local_addr()
+                        .expect("listener should have a local address");
+                    drop(listener);
+                    build_router(test_state_with_base_url(format!("http://{}", addr)))
+                }
+                UpstreamMode::HttpFailure => {
+                    let (base_url, handle) = spawn_mock_openai_error_server().await;
+                    mock_handle = Some(handle);
+                    build_router(test_state_with_base_url(base_url))
+                }
+            };
+
+            let mut request_builder = Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json");
+
+            request_builder = match case.api_key {
+                ApiKeyMode::Missing => request_builder,
+                ApiKeyMode::Plain(value) => request_builder.header("x-api-key", value),
+            };
+
+            let response = app
+                .oneshot(
+                    request_builder
+                        .body(Body::from(case.payload))
+                        .expect("request build should succeed"),
+                )
+                .await
+                .unwrap_or_else(|_| panic!("request should complete for {}", case.name));
+
+            assert_eq!(
+                response.status(),
+                case.expected_status,
+                "status mismatch in {}",
+                case.name
+            );
+
+            let request_id_header = response
+                .headers()
+                .get("x-request-id")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_else(|| panic!("x-request-id should be present in {}", case.name))
+                .to_string();
+            assert!(
+                request_id_header.starts_with("req-"),
+                "x-request-id must use req- prefix in {}",
+                case.name
+            );
+
+            let body = parse_json_body(response).await;
+            if let Some(source) = case.expected_source {
+                assert_eq!(
+                    body["type"], "error",
+                    "error envelope type drift in {}",
+                    case.name
+                );
+                let error = body
+                    .get("error")
+                    .and_then(Value::as_object)
+                    .unwrap_or_else(|| panic!("error body missing in {}", case.name));
+                assert_eq!(
+                    error.get("source").and_then(Value::as_str),
+                    Some(source),
+                    "error source drift in {}",
+                    case.name
+                );
+                assert_eq!(
+                    error.get("request_id").and_then(Value::as_str),
+                    Some(request_id_header.as_str()),
+                    "request_id mismatch in {}",
+                    case.name
+                );
+                if let Some(message) = case.expected_message {
+                    assert_eq!(
+                        error.get("message").and_then(Value::as_str),
+                        Some(message),
+                        "error message drift in {}",
+                        case.name
+                    );
+                }
+            } else {
+                assert_eq!(
+                    body.get("type").and_then(Value::as_str),
+                    Some("message"),
+                    "non-stream response type drift in {}",
+                    case.name
+                );
+                assert_eq!(
+                    body.get("role").and_then(Value::as_str),
+                    Some("assistant"),
+                    "role drift in {}",
+                    case.name
+                );
+                assert!(
+                    body.get("id")
+                        .and_then(Value::as_str)
+                        .is_some_and(|id| id.starts_with("msg_")),
+                    "id must start with msg_ in {}",
+                    case.name
+                );
+                assert!(
+                    body.get("content").is_some_and(Value::is_array),
+                    "content must be array in {}",
+                    case.name
+                );
+                assert!(
+                    body.get("model").is_some_and(Value::is_string),
+                    "model must be string in {}",
+                    case.name
+                );
+                assert!(
+                    body.get("usage").is_some_and(Value::is_object),
+                    "usage must be object in {}",
+                    case.name
+                );
+                assert!(
+                    body.get("error").is_none(),
+                    "success response must not include error envelope in {}",
+                    case.name
+                );
+            }
+
+            if let Some(handle) = mock_handle {
+                handle.abort();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_smoke_self_host_is_runnable_with_minimal_state() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener bind should succeed");
+        let addr = listener
+            .local_addr()
+            .expect("listener should have a local address");
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+
         let app = build_router(test_state());
-        let payload = r#"{"model":"claude-sonnet-4","messages":[]}"#;
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = shutdown_rx.await;
+                })
+                .await;
+        });
 
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/v1/messages")
-                    .header("content-type", "application/json")
-                    .body(Body::from(payload))
-                    .expect("request build should succeed"),
-            )
-            .await
-            .expect("request should complete");
+        tokio::time::sleep(Duration::from_millis(50)).await;
 
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-        assert!(response.headers().contains_key("x-request-id"));
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        let response = Client::new()
+            .get(format!("http://{}/not-found", addr))
+            .send()
             .await
-            .expect("body should be readable");
-        let body_text = String::from_utf8(body.to_vec()).expect("body should be utf8");
-        assert!(body_text.contains("\"source\":\"local_auth\""));
-        assert!(body_text.contains("\"request_id\":\"req-"));
+            .expect("smoke request should reach self-hosted server");
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(
+            response.headers().contains_key("x-request-id"),
+            "startup smoke should preserve request-id middleware wiring"
+        );
+
+        let _ = shutdown_tx.send(());
+        let _ = server.await;
     }
 
     #[tokio::test]
@@ -648,7 +958,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn messages_invalid_api_key_header_returns_local_validation_error() {
+    async fn messages_invalid_api_key_header_returns_local_auth_error() {
         let app = build_router(test_state());
         let payload = r#"{"model":"claude-sonnet-4","messages":[]}"#;
         let invalid_header = HeaderValue::from_bytes(&[0x80]).expect("header value should build");
@@ -666,21 +976,23 @@ mod tests {
             .await
             .expect("request should complete");
 
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         assert!(response.headers().contains_key("x-request-id"));
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .expect("body should be readable");
         let body_text = String::from_utf8(body.to_vec()).expect("body should be utf8");
-        assert!(body_text.contains("\"source\":\"local_validation\""));
-        assert!(body_text.contains("\"message\":\"Invalid x-api-key header format\""));
+        assert!(body_text.contains("\"source\":\"local_auth\""));
+        assert!(body_text.contains("\"message\":\"Invalid x-api-key\""));
+        assert!(body_text.contains("\"type\":\"error\""));
+        assert!(!body_text.contains("dummy"));
         assert!(body_text.contains("\"request_id\":\"req-"));
     }
 
     #[tokio::test]
-    async fn messages_invalid_json_returns_local_validation_error() {
+    async fn messages_wrong_api_key_returns_local_auth_error() {
         let app = build_router(test_state());
-        let payload = r#"{"model":"claude-sonnet-4","messages":[}"#;
+        let payload = r#"{"model":"claude-sonnet-4","messages":[]}"#;
 
         let response = app
             .oneshot(
@@ -688,21 +1000,21 @@ mod tests {
                     .method("POST")
                     .uri("/v1/messages")
                     .header("content-type", "application/json")
+                    .header("x-api-key", "wrong-key")
                     .body(Body::from(payload))
                     .expect("request build should succeed"),
             )
             .await
             .expect("request should complete");
 
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert!(response.headers().contains_key("x-request-id"));
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .expect("body should be readable");
         let body_text = String::from_utf8(body.to_vec()).expect("body should be utf8");
-        assert!(body_text.contains("\"source\":\"local_validation\""));
-        assert!(body_text.contains("\"message\":\"Malformed request payload\""));
-        assert!(body_text.contains("\"request_id\":\"req-"));
+        assert!(body_text.contains("\"source\":\"local_auth\""));
+        assert!(body_text.contains("\"message\":\"Invalid x-api-key\""));
+        assert!(!body_text.contains("wrong-key"));
     }
 
     #[tokio::test]
@@ -716,6 +1028,7 @@ mod tests {
                     .method("POST")
                     .uri("/v1/messages")
                     .header("content-type", "application/json")
+                    .header("x-api-key", "dummy")
                     .body(Body::from(payload))
                     .expect("request build should succeed"),
             )
@@ -763,6 +1076,7 @@ mod tests {
                     .method("POST")
                     .uri("/v1/messages")
                     .header("content-type", "application/json")
+                    .header("x-api-key", "dummy")
                     .body(Body::from(payload))
                     .expect("request build should succeed"),
             )
@@ -794,7 +1108,7 @@ mod tests {
                     .method("POST")
                     .uri("/v1/messages")
                     .header("content-type", "application/json")
-                    .header("x-api-key", "test-key")
+                    .header("x-api-key", "dummy")
                     .body(Body::from(payload))
                     .expect("request build should succeed"),
             )
@@ -825,7 +1139,7 @@ mod tests {
                     .method("POST")
                     .uri("/v1/messages")
                     .header("content-type", "application/json")
-                    .header("x-api-key", "test-key")
+                    .header("x-api-key", "dummy")
                     .body(Body::from(payload))
                     .expect("request build should succeed"),
             )
@@ -855,75 +1169,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn messages_upstream_connectivity_failure_returns_upstream_error() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("listener bind should succeed");
-        let addr = listener
-            .local_addr()
-            .expect("listener should have a local address");
-        drop(listener);
-
-        let app = build_router(test_state_with_base_url(format!("http://{}", addr)));
-        let payload =
-            r#"{"model":"claude-sonnet-4","messages":[{"role":"user","content":"Hello"}]}"#;
-
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/v1/messages")
-                    .header("content-type", "application/json")
-                    .header("x-api-key", "test-key")
-                    .body(Body::from(payload))
-                    .expect("request build should succeed"),
-            )
-            .await
-            .expect("request should complete");
-
-        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
-        assert!(response.headers().contains_key("x-request-id"));
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("body should be readable");
-        let body_text = String::from_utf8(body.to_vec()).expect("body should be utf8");
-        assert!(body_text.contains("\"source\":\"upstream\""));
-        assert!(body_text.contains("\"message\":\"Failed to contact upstream provider\""));
-        assert!(body_text.contains("\"request_id\":\"req-"));
-    }
-
-    #[tokio::test]
-    async fn messages_upstream_http_error_returns_upstream_error() {
-        let (base_url, _server) = spawn_mock_openai_error_server().await;
-        let app = build_router(test_state_with_base_url(base_url));
-        let payload =
-            r#"{"model":"claude-sonnet-4","messages":[{"role":"user","content":"Hello"}]}"#;
-
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/v1/messages")
-                    .header("content-type", "application/json")
-                    .header("x-api-key", "test-key")
-                    .body(Body::from(payload))
-                    .expect("request build should succeed"),
-            )
-            .await
-            .expect("request should complete");
-
-        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
-        assert!(response.headers().contains_key("x-request-id"));
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("body should be readable");
-        let body_text = String::from_utf8(body.to_vec()).expect("body should be utf8");
-        assert!(body_text.contains("\"source\":\"upstream\""));
-        assert!(body_text.contains("\"message\":\"Upstream provider returned an error\""));
-        assert!(body_text.contains("\"request_id\":\"req-"));
-    }
-
-    #[tokio::test]
     async fn messages_unparseable_upstream_payload_returns_upstream_error() {
         let (base_url, _server) = spawn_mock_openai_invalid_json_server().await;
         let app = build_router(test_state_with_base_url(base_url));
@@ -936,7 +1181,7 @@ mod tests {
                     .method("POST")
                     .uri("/v1/messages")
                     .header("content-type", "application/json")
-                    .header("x-api-key", "test-key")
+                    .header("x-api-key", "dummy")
                     .body(Body::from(payload))
                     .expect("request build should succeed"),
             )
@@ -968,6 +1213,30 @@ mod tests {
             error.get("request_id").and_then(Value::as_str),
             Some(request_id_header.as_str())
         );
+    }
+
+    #[tokio::test]
+    async fn switch_model_missing_api_key_returns_local_auth_error() {
+        let app = build_router(test_state());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/switch-model")
+                    .body(Body::empty())
+                    .expect("request build should succeed"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(response.headers().contains_key("x-request-id"));
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should be readable");
+        let body_text = String::from_utf8(body.to_vec()).expect("body should be utf8");
+        assert!(body_text.contains("\"source\":\"local_auth\""));
     }
 
     async fn spawn_mock_openai_server() -> (String, tokio::task::JoinHandle<()>) {
@@ -1062,7 +1331,8 @@ mod tests {
         let config = Config {
             port: 3332,
             base_url,
-            api_key: "dummy".to_string(),
+            api_key: "upstream-provider-key".to_string(),
+            inbound_api_key: "dummy".to_string(),
             model_haiku: "haiku".to_string(),
             model_sonnet: "sonnet".to_string(),
             model_opus: "opus".to_string(),
@@ -1071,6 +1341,7 @@ mod tests {
             config: Arc::new(RwLock::new(config)),
             logging_path: Arc::new(None),
             client: Client::new(),
+            inbound_api_key: Arc::new("dummy".to_string()),
         }
     }
 }

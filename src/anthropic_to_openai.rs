@@ -287,6 +287,7 @@ mod tests {
             port: 3332,
             base_url: "http://localhost".to_string(),
             api_key: "dummy".to_string(),
+            inbound_api_key: "dummy".to_string(),
             model_haiku: "mapped-haiku".to_string(),
             model_sonnet: "mapped-sonnet".to_string(),
             model_opus: "mapped-opus".to_string(),

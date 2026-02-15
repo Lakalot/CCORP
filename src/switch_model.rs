@@ -1,8 +1,12 @@
+use crate::RequestId;
+use crate::domain::errors::ErrorSource;
+use crate::interfaces::error_response;
 use crate::openrouter;
 use minijinja::Environment;
 use serde::{Deserialize, Serialize};
 
 use axum::{
+    Extension,
     extract::{Json, State},
     http::StatusCode,
     response::{Html, IntoResponse, Response},
@@ -53,6 +57,7 @@ pub async fn switch_model_get(State(state): State<crate::AppState>) -> Html<Stri
 /// POST /switch-model - Save selected models to config.json
 pub async fn switch_model_post(
     State(state): State<crate::AppState>,
+    Extension(request_id): Extension<RequestId>,
     Json(selection): Json<ModelSelection>,
 ) -> Response {
     let mut config = state.config.write().await;
@@ -62,12 +67,14 @@ pub async fn switch_model_post(
     match config.write() {
         Ok(()) => (StatusCode::OK, "Models updated successfully").into_response(),
         Err(err) => {
-            tracing::error!("Config write failed: {err}");
-            (
+            tracing::error!(request_id = %request_id.0, "Config write failed: {err}");
+            error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorSource::Internal,
                 format!("Failed to save configuration: {err}"),
+                request_id.0,
             )
-                .into_response()
+            .into_response()
         }
     }
 }
