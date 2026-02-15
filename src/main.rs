@@ -7,6 +7,7 @@ mod interfaces;
 mod models;
 mod openai_to_anthropic;
 mod openrouter;
+mod stream;
 mod switch_model;
 
 use axum::{
@@ -32,6 +33,7 @@ use std::{
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+use stream::{map_stop_reason, parse_openai_stream_chunk, stream_error_event};
 use tokio::sync::RwLock;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -83,6 +85,7 @@ async fn main() {
     let inbound_key = settings.inbound_api_key.clone();
     let client = Client::builder()
         .connect_timeout(Duration::from_secs(10))
+        .read_timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
         .build()
         .expect("HTTP client should build");
     let state = AppState {
@@ -361,7 +364,7 @@ fn forward_stream(
     base_url: String,
     api_key: String,
     openai_request: models::OpenAIRequest,
-    _logging_path: Arc<Option<String>>,
+    logging_path: Arc<Option<String>>,
     request_id: String,
 ) -> Response {
     let stream = async_stream::stream! {
@@ -373,23 +376,40 @@ fn forward_stream(
             .await;
 
         let Ok(res) = res else {
+            tracing::error!(
+                request_id = %request_id,
+                "upstream stream connection failed"
+            );
             let event = stream_error_event(
                 ErrorSource::Upstream,
                 "Failed to contact upstream provider",
                 &request_id,
             );
+            log_payload(&logging_path, "stream-error", &event);
             yield Ok::<_, axum::Error>(event.into_bytes());
             return;
         };
 
         if !res.status().is_success() {
+            let status = res.status();
             let upstream_body = res.text().await.unwrap_or_default();
-            tracing::error!("OpenRouter request failed: {}", upstream_body);
+            let log_body: String = upstream_body.chars().take(512).collect();
+            tracing::error!(
+                request_id = %request_id,
+                upstream_status = %status,
+                "upstream stream request failed: {}", log_body
+            );
+            let message = if status == StatusCode::TOO_MANY_REQUESTS {
+                "Upstream provider rate-limited"
+            } else {
+                "Upstream provider returned an error"
+            };
             let event = stream_error_event(
                 ErrorSource::Upstream,
-                "Upstream provider returned an error",
+                message,
                 &request_id,
             );
+            log_payload(&logging_path, "stream-error", &event);
             yield Ok::<_, axum::Error>(event.into_bytes());
             return;
         }
@@ -420,9 +440,14 @@ fn forward_stream(
         let mut tool_block_open = false;
         let mut block_index: u32 = 0;
         let mut final_stop_reason: Option<String> = None;
+        let mut saw_done_frame = false;
 
         while let Some(item) = byte_stream.next().await {
             let Ok(chunk) = item else {
+                tracing::warn!(
+                    request_id = %request_id,
+                    "upstream stream chunk read failed"
+                );
                 if content_block_open || tool_block_open {
                     let content_block_stop = json!({
                         "type": "content_block_stop",
@@ -436,6 +461,7 @@ fn forward_stream(
                     "Streaming response interrupted",
                     &request_id,
                 );
+                log_payload(&logging_path, "stream-error", &event);
                 yield Ok::<_, axum::Error>(event.into_bytes());
                 return;
             };
@@ -453,11 +479,16 @@ fn forward_stream(
 
                 if let Some(data) = frame.strip_prefix("data: ") {
                     if data == "[DONE]" {
+                        saw_done_frame = true;
                         break;
                     }
                     let parsed_chunk = match parse_openai_stream_chunk(data) {
                         Ok(parsed) => parsed,
                         Err(_) => {
+                            tracing::warn!(
+                                request_id = %request_id,
+                                "upstream stream chunk could not be parsed"
+                            );
                             if content_block_open || tool_block_open {
                                 let content_block_stop = json!({
                                     "type": "content_block_stop",
@@ -471,6 +502,7 @@ fn forward_stream(
                                 "Upstream stream chunk could not be parsed",
                                 &request_id,
                             );
+                            log_payload(&logging_path, "stream-error", &event);
                             yield Ok::<_, axum::Error>(event.into_bytes());
                             return;
                         }
@@ -583,6 +615,21 @@ fn forward_stream(
             yield Ok::<_, axum::Error>(sse_event.into_bytes());
         }
 
+        if !saw_done_frame {
+            tracing::warn!(
+                request_id = %request_id,
+                "upstream stream ended without [DONE] frame"
+            );
+            let event = stream_error_event(
+                ErrorSource::Upstream,
+                "Streaming response interrupted",
+                &request_id,
+            );
+            log_payload(&logging_path, "stream-error", &event);
+            yield Ok::<_, axum::Error>(event.into_bytes());
+            return;
+        }
+
         if let Some(stop_reason) = final_stop_reason {
             let message_delta = json!({
                 "type": "message_delta",
@@ -609,6 +656,7 @@ fn forward_stream(
 
     Response::builder()
         .header(header::CONTENT_TYPE, "text/event-stream")
+        .header(header::CACHE_CONTROL, "no-cache")
         .body(body)
         .unwrap()
 }
@@ -738,92 +786,10 @@ fn is_sensitive_header_name(lower_name: &str) -> bool {
             && !lower_name.contains("cache"))
 }
 
-fn stream_error_event(source: ErrorSource, message: &str, request_id: &str) -> String {
-    let payload = json!({
-        "type": "error",
-        "error": {
-            "source": source,
-            "message": message,
-            "request_id": request_id
-        }
-    });
-    format!("event: error\ndata: {payload}\n\n")
-}
-
-struct ToolCallDelta {
-    id: Option<String>,
-    name: Option<String>,
-    arguments: Option<String>,
-}
-
-struct ParsedChunk {
-    content: Option<String>,
-    tool_calls: Vec<ToolCallDelta>,
-    finish_reason: Option<String>,
-}
-
-fn parse_openai_stream_chunk(data: &str) -> Result<Option<ParsedChunk>, ()> {
-    let value: serde_json::Value = serde_json::from_str(data).map_err(|_| ())?;
-    let Some(choices) = value.get("choices").and_then(serde_json::Value::as_array) else {
-        return Ok(None);
-    };
-    let Some(choice) = choices.first() else {
-        return Ok(None);
-    };
-
-    let content = choice
-        .get("delta")
-        .and_then(|delta| delta.get("content"))
-        .and_then(serde_json::Value::as_str)
-        .map(ToString::to_string);
-    let finish_reason = choice
-        .get("finish_reason")
-        .and_then(serde_json::Value::as_str)
-        .map(ToString::to_string);
-
-    let mut tool_calls = Vec::new();
-    if let Some(tc_array) = choice
-        .get("delta")
-        .and_then(|d| d.get("tool_calls"))
-        .and_then(serde_json::Value::as_array)
-    {
-        for tc in tc_array {
-            tool_calls.push(ToolCallDelta {
-                id: tc.get("id").and_then(|v| v.as_str()).map(String::from),
-                name: tc
-                    .get("function")
-                    .and_then(|f| f.get("name"))
-                    .and_then(|v| v.as_str())
-                    .map(String::from),
-                arguments: tc
-                    .get("function")
-                    .and_then(|f| f.get("arguments"))
-                    .and_then(|v| v.as_str())
-                    .map(String::from),
-            });
-        }
-    }
-
-    Ok(Some(ParsedChunk {
-        content,
-        tool_calls,
-        finish_reason,
-    }))
-}
-
-fn map_stop_reason(finish_reason: &str) -> &str {
-    match finish_reason {
-        "tool_calls" => "tool_use",
-        "length" => "max_tokens",
-        _ => "end_turn",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        AppState, build_router, next_request_id, parse_openai_stream_chunk,
-        redact_sensitive_headers, resolve_stream_mode,
+        AppState, build_router, next_request_id, redact_sensitive_headers, resolve_stream_mode,
     };
     use crate::config::Config;
     use axum::{
@@ -915,39 +881,6 @@ mod tests {
     #[test]
     fn stream_mode_uses_explicit_false_flag() {
         assert!(!resolve_stream_mode(Some(false)));
-    }
-
-    #[test]
-    fn parse_openai_stream_chunk_ignores_non_choice_payloads() {
-        let parsed =
-            parse_openai_stream_chunk(r#"{"type":"ping"}"#).expect("payload should be valid json");
-        assert!(parsed.is_none());
-    }
-
-    #[test]
-    fn parse_openai_stream_chunk_extracts_content_and_finish_reason() {
-        let parsed = parse_openai_stream_chunk(
-            r#"{"id":"s","model":"m","choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":"tool_calls"}]}"#,
-        )
-        .expect("payload should parse")
-        .expect("choice payload should be extracted");
-        assert_eq!(parsed.content.as_deref(), Some("hi"));
-        assert_eq!(parsed.finish_reason.as_deref(), Some("tool_calls"));
-        assert!(parsed.tool_calls.is_empty());
-    }
-
-    #[test]
-    fn parse_openai_stream_chunk_extracts_tool_call_deltas() {
-        let parsed = parse_openai_stream_chunk(
-            r#"{"id":"s","model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{}"}}]},"finish_reason":null}]}"#,
-        )
-        .expect("payload should parse")
-        .expect("choice payload should be extracted");
-        assert!(parsed.content.is_none());
-        assert_eq!(parsed.tool_calls.len(), 1);
-        assert_eq!(parsed.tool_calls[0].id.as_deref(), Some("call_1"));
-        assert_eq!(parsed.tool_calls[0].name.as_deref(), Some("lookup"));
-        assert_eq!(parsed.tool_calls[0].arguments.as_deref(), Some("{}"));
     }
 
     enum ApiKeyMode {
@@ -1768,6 +1701,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn messages_stream_truncated_upstream_emits_error_event_with_request_correlation() {
+        let (base_url, _server) = spawn_mock_openai_truncated_stream_server().await;
+        let app = build_router(test_state_with_base_url(base_url));
+        let payload = r#"{"model":"claude-sonnet-4","stream":true,"messages":[{"role":"user","content":"Hello"}]}"#;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("content-type", "application/json")
+                    .header("x-api-key", "dummy")
+                    .body(Body::from(payload))
+                    .expect("request build should succeed"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let request_id_header = response
+            .headers()
+            .get("x-request-id")
+            .and_then(|v| v.to_str().ok())
+            .expect("x-request-id should be present")
+            .to_string();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should be readable");
+        let body_text = String::from_utf8(body.to_vec()).expect("body should be utf8");
+        let events = parse_sse_events(&body_text);
+        let event_names: Vec<&str> = events.iter().map(|(name, _)| name.as_str()).collect();
+
+        assert_eq!(
+            event_names,
+            vec![
+                "message_start",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_stop",
+                "error"
+            ]
+        );
+        let error_payload = events
+            .last()
+            .expect("error event must exist")
+            .1
+            .get("error")
+            .cloned()
+            .expect("error body must exist");
+        assert_eq!(
+            error_payload.get("source").and_then(Value::as_str),
+            Some("upstream")
+        );
+        assert_eq!(
+            error_payload.get("request_id").and_then(Value::as_str),
+            Some(request_id_header.as_str())
+        );
+        assert_eq!(
+            error_payload.get("message").and_then(Value::as_str),
+            Some("Streaming response interrupted")
+        );
+        assert!(
+            !event_names.contains(&"message_stop"),
+            "terminal success event must not be emitted on truncated upstream stream"
+        );
+    }
+
+    #[tokio::test]
     async fn messages_stream_unknown_events_and_tool_deltas_are_handled_gracefully() {
         let (base_url, _server) = spawn_mock_openai_stream_with_unknown_event_server().await;
         let app = build_router(test_state_with_base_url(base_url));
@@ -2212,6 +2213,66 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn messages_stream_upstream_rate_limited_emits_error_event() {
+        let (base_url, _server) = spawn_mock_openai_rate_limited_server().await;
+        let app = build_router(test_state_with_base_url(base_url));
+        let payload = r#"{"model":"claude-sonnet-4","stream":true,"messages":[{"role":"user","content":"Hello"}]}"#;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("content-type", "application/json")
+                    .header("x-api-key", "dummy")
+                    .body(Body::from(payload))
+                    .expect("request build should succeed"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("text/event-stream")
+        );
+        let request_id_header = response
+            .headers()
+            .get("x-request-id")
+            .and_then(|v| v.to_str().ok())
+            .expect("x-request-id should be present")
+            .to_string();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should be readable");
+        let body_text = String::from_utf8(body.to_vec()).expect("body should be utf8");
+        let events = parse_sse_events(&body_text);
+        let event_names: Vec<&str> = events.iter().map(|(name, _)| name.as_str()).collect();
+
+        assert_eq!(event_names, vec!["error"]);
+        let error_payload = events[0]
+            .1
+            .get("error")
+            .cloned()
+            .expect("error body must exist");
+        assert_eq!(
+            error_payload.get("source").and_then(Value::as_str),
+            Some("upstream")
+        );
+        assert_eq!(
+            error_payload.get("message").and_then(Value::as_str),
+            Some("Upstream provider rate-limited")
+        );
+        assert_eq!(
+            error_payload.get("request_id").and_then(Value::as_str),
+            Some(request_id_header.as_str())
+        );
+    }
+
     async fn spawn_mock_openai_server() -> (String, tokio::task::JoinHandle<()>) {
         async fn chat_completions_handler() -> (StatusCode, Json<serde_json::Value>) {
             let response = json!({
@@ -2318,6 +2379,28 @@ mod tests {
         }
 
         let app = Router::new().route("/chat/completions", post(chat_completions_error_handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener bind should succeed");
+        let addr = listener
+            .local_addr()
+            .expect("listener should have a local address");
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        (format!("http://{}", addr), handle)
+    }
+
+    async fn spawn_mock_openai_rate_limited_server() -> (String, tokio::task::JoinHandle<()>) {
+        async fn chat_completions_rate_limited_handler() -> (StatusCode, &'static str) {
+            (StatusCode::TOO_MANY_REQUESTS, "rate-limited")
+        }
+
+        let app = Router::new().route(
+            "/chat/completions",
+            post(chat_completions_rate_limited_handler),
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("listener bind should succeed");
@@ -2461,6 +2544,39 @@ mod tests {
         (format!("http://{}", addr), handle)
     }
 
+    async fn spawn_mock_openai_truncated_stream_server() -> (String, tokio::task::JoinHandle<()>) {
+        async fn chat_completions_stream_handler(Json(body): Json<Value>) -> HttpResponse<Body> {
+            assert_eq!(
+                body.get("stream").and_then(Value::as_bool),
+                Some(true),
+                "upstream request must contain stream: true"
+            );
+            let payload = concat!(
+                "data: {\"id\":\"chatcmpl-stream\",\"model\":\"openai-test-model\",",
+                "\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",",
+                "\"content\":\"STREAM_OK\"},\"finish_reason\":null}]}\n\n"
+            );
+            HttpResponse::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "text/event-stream")
+                .body(Body::from(payload))
+                .expect("response build should succeed")
+        }
+
+        let app = Router::new().route("/chat/completions", post(chat_completions_stream_handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener bind should succeed");
+        let addr = listener
+            .local_addr()
+            .expect("listener should have a local address");
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        (format!("http://{}", addr), handle)
+    }
+
     async fn parse_json_body(response: Response) -> Value {
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
@@ -2490,6 +2606,111 @@ mod tests {
             .collect()
     }
 
+    async fn spawn_mock_openai_stalled_stream_server() -> (String, tokio::task::JoinHandle<()>) {
+        async fn chat_completions_stream_handler(Json(body): Json<Value>) -> HttpResponse<Body> {
+            assert_eq!(
+                body.get("stream").and_then(Value::as_bool),
+                Some(true),
+                "upstream request must contain stream: true"
+            );
+            let stream = async_stream::stream! {
+                let chunk = concat!(
+                    "data: {\"id\":\"chatcmpl-stream\",\"model\":\"openai-test-model\",",
+                    "\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"},",
+                    "\"finish_reason\":null}]}\n\n"
+                );
+                yield Ok::<_, std::io::Error>(chunk.to_string());
+                // Stall: sleep longer than the client's read_timeout
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                yield Ok::<_, std::io::Error>("data: [DONE]\n\n".to_string());
+            };
+            HttpResponse::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "text/event-stream")
+                .body(Body::from_stream(stream))
+                .expect("response build should succeed")
+        }
+
+        let app = Router::new().route("/chat/completions", post(chat_completions_stream_handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener bind should succeed");
+        let addr = listener
+            .local_addr()
+            .expect("listener should have a local address");
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        (format!("http://{}", addr), handle)
+    }
+
+    #[tokio::test]
+    async fn messages_stream_stalled_upstream_emits_error_event() {
+        let (base_url, _server) = spawn_mock_openai_stalled_stream_server().await;
+        let app = build_router(test_state_with_read_timeout(
+            base_url,
+            Duration::from_secs(1),
+        ));
+        let payload = r#"{"model":"claude-sonnet-4","stream":true,"messages":[{"role":"user","content":"Hello"}]}"#;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("content-type", "application/json")
+                    .header("x-api-key", "dummy")
+                    .body(Body::from(payload))
+                    .expect("request build should succeed"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("text/event-stream")
+        );
+        let request_id_header = response
+            .headers()
+            .get("x-request-id")
+            .and_then(|v| v.to_str().ok())
+            .expect("x-request-id should be present")
+            .to_string();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should be readable");
+        let body_text = String::from_utf8(body.to_vec()).expect("body should be utf8");
+        let events = parse_sse_events(&body_text);
+        let event_names: Vec<&str> = events.iter().map(|(name, _)| name.as_str()).collect();
+
+        assert!(
+            event_names.contains(&"error"),
+            "stalled stream must produce an error event"
+        );
+        assert!(
+            !event_names.contains(&"message_stop"),
+            "terminal success event must not be emitted on stalled stream"
+        );
+        let error_event = events
+            .iter()
+            .find(|(name, _)| name == "error")
+            .expect("error event must exist");
+        let error_payload = error_event.1.get("error").expect("error body must exist");
+        assert_eq!(
+            error_payload.get("source").and_then(Value::as_str),
+            Some("upstream")
+        );
+        assert_eq!(
+            error_payload.get("request_id").and_then(Value::as_str),
+            Some(request_id_header.as_str())
+        );
+    }
+
     fn test_state() -> AppState {
         test_state_with_base_url("https://openrouter.ai/api/v1".to_string())
     }
@@ -2508,6 +2729,28 @@ mod tests {
             config: Arc::new(RwLock::new(config)),
             logging_path: Arc::new(None),
             client: Client::new(),
+            inbound_api_key: Arc::new("dummy".to_string()),
+        }
+    }
+
+    fn test_state_with_read_timeout(base_url: String, timeout: Duration) -> AppState {
+        let config = Config {
+            port: 3332,
+            base_url,
+            api_key: "upstream-provider-key".to_string(),
+            inbound_api_key: "dummy".to_string(),
+            model_haiku: "haiku".to_string(),
+            model_sonnet: "sonnet".to_string(),
+            model_opus: "opus".to_string(),
+        };
+        let client = Client::builder()
+            .read_timeout(timeout)
+            .build()
+            .expect("client should build");
+        AppState {
+            config: Arc::new(RwLock::new(config)),
+            logging_path: Arc::new(None),
+            client,
             inbound_api_key: Arc::new("dummy".to_string()),
         }
     }
