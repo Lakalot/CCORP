@@ -350,7 +350,7 @@ fn forward_stream(
     base_url: String,
     api_key: String,
     openai_request: models::OpenAIRequest,
-    logging_path: Arc<Option<String>>,
+    _logging_path: Arc<Option<String>>,
     request_id: String,
 ) -> Response {
     let stream = async_stream::stream! {
@@ -383,11 +383,42 @@ fn forward_stream(
             return;
         }
 
-        let mut byte_stream = res.bytes_stream();
+        let msg_id = format!("msg_{}", &request_id);
+        let message_start = json!({
+            "type": "message_start",
+            "message": {
+                "id": msg_id,
+                "type": "message",
+                "role": "assistant",
+                "content": [],
+                "model": openai_request.model,
+                "stop_reason": null,
+                "stop_sequence": null,
+                "usage": {
+                    "input_tokens": 0,
+                    "output_tokens": 0
+                }
+            }
+        });
+        let sse_event = format!("event: message_start\ndata: {message_start}\n\n");
+        yield Ok::<_, axum::Error>(sse_event.into_bytes());
 
-        let mut full_response = String::new();
+        let mut byte_stream = res.bytes_stream();
+        let mut buffer = String::new();
+        let mut content_block_open = false;
+        let block_index: u32 = 0;
+        let mut final_stop_reason: Option<String> = None;
+
         while let Some(item) = byte_stream.next().await {
             let Ok(chunk) = item else {
+                if content_block_open {
+                    let content_block_stop = json!({
+                        "type": "content_block_stop",
+                        "index": block_index
+                    });
+                    let sse_event = format!("event: content_block_stop\ndata: {content_block_stop}\n\n");
+                    yield Ok::<_, axum::Error>(sse_event.into_bytes());
+                }
                 let event = stream_error_event(
                     ErrorSource::Upstream,
                     "Streaming response interrupted",
@@ -396,30 +427,103 @@ fn forward_stream(
                 yield Ok::<_, axum::Error>(event.into_bytes());
                 return;
             };
-            full_response.push_str(&String::from_utf8_lossy(&chunk));
             let chunk_str = String::from_utf8_lossy(&chunk);
-            for line in chunk_str.split("\n\n") {
-                if let Some(data) = line.strip_prefix("data: ") {
+            buffer.push_str(&chunk_str);
+
+            while let Some(pos) = buffer.find("\n\n") {
+                let frame = buffer[..pos].to_string();
+                buffer = buffer[pos + 2..].to_string();
+
+                let frame = frame.trim();
+                if frame.is_empty() {
+                    continue;
+                }
+
+                if let Some(data) = frame.strip_prefix("data: ") {
                     if data == "[DONE]" {
                         break;
                     }
-                    if let Ok(stream_res) = serde_json::from_str::<OpenAIStreamResponse>(data)
-                        && let Some(choice) = stream_res.choices.first()
-                        && let Some(content) = &choice.delta.content
-                    {
-                        let anthropic_stream_event = json!({
-                            "type": "content_block_delta",
-                            "index": 0,
-                            "delta": {
-                                "type": "text_delta",
-                                "text": content
+                    let stream_res = match serde_json::from_str::<OpenAIStreamResponse>(data) {
+                        Ok(parsed) => parsed,
+                        Err(_) => {
+                            if content_block_open {
+                                let content_block_stop = json!({
+                                    "type": "content_block_stop",
+                                    "index": block_index
+                                });
+                                let sse_event = format!("event: content_block_stop\ndata: {content_block_stop}\n\n");
+                                yield Ok::<_, axum::Error>(sse_event.into_bytes());
                             }
-                        });
-                        let sse_event = format!("event: content_block_delta\ndata: {anthropic_stream_event}\n\n");
-                        yield Ok::<_, axum::Error>(sse_event.into_bytes());
+                            let event = stream_error_event(
+                                ErrorSource::Upstream,
+                                "Upstream stream chunk could not be parsed",
+                                &request_id,
+                            );
+                            yield Ok::<_, axum::Error>(event.into_bytes());
+                            return;
+                        }
+                    };
+
+                    if let Some(choice) = stream_res.choices.first() {
+                        if let Some(content) = &choice.delta.content {
+                            if !content_block_open {
+                                let content_block_start = json!({
+                                    "type": "content_block_start",
+                                    "index": block_index,
+                                    "content_block": {
+                                        "type": "text",
+                                        "text": ""
+                                    }
+                                });
+                                let sse_event = format!("event: content_block_start\ndata: {content_block_start}\n\n");
+                                yield Ok::<_, axum::Error>(sse_event.into_bytes());
+                                content_block_open = true;
+                            }
+
+                            let anthropic_stream_event = json!({
+                                "type": "content_block_delta",
+                                "index": block_index,
+                                "delta": {
+                                    "type": "text_delta",
+                                    "text": content
+                                }
+                            });
+                            let sse_event = format!("event: content_block_delta\ndata: {anthropic_stream_event}\n\n");
+                            yield Ok::<_, axum::Error>(sse_event.into_bytes());
+                        }
+
+                        if let Some(reason) = &choice.finish_reason
+                            && !reason.is_empty()
+                        {
+                            final_stop_reason = Some(map_stop_reason(reason).to_string());
+                        }
                     }
                 }
             }
+        }
+
+        if content_block_open {
+            let content_block_stop = json!({
+                "type": "content_block_stop",
+                "index": block_index
+            });
+            let sse_event = format!("event: content_block_stop\ndata: {content_block_stop}\n\n");
+            yield Ok::<_, axum::Error>(sse_event.into_bytes());
+        }
+
+        if let Some(stop_reason) = final_stop_reason {
+            let message_delta = json!({
+                "type": "message_delta",
+                "delta": {
+                    "stop_reason": stop_reason,
+                    "stop_sequence": null
+                },
+                "usage": {
+                    "output_tokens": 0
+                }
+            });
+            let sse_event = format!("event: message_delta\ndata: {message_delta}\n\n");
+            yield Ok::<_, axum::Error>(sse_event.into_bytes());
         }
 
         let message_stop = json!({
@@ -427,10 +531,6 @@ fn forward_stream(
         });
         let sse_event = format!("event: message_stop\ndata: {message_stop}\n\n");
         yield Ok::<_, axum::Error>(sse_event.into_bytes());
-
-        if let Ok(response_json) = serde_json::to_string_pretty(&full_response) {
-            log_payload(&logging_path, "response", &response_json);
-        }
     };
 
     let body = Body::from_stream(stream);
@@ -576,6 +676,14 @@ fn stream_error_event(source: ErrorSource, message: &str, request_id: &str) -> S
         }
     });
     format!("event: error\ndata: {payload}\n\n")
+}
+
+fn map_stop_reason(finish_reason: &str) -> &str {
+    match finish_reason {
+        "tool_calls" => "tool_use",
+        "length" => "max_tokens",
+        _ => "end_turn",
+    }
 }
 
 #[cfg(test)]
@@ -1226,9 +1334,124 @@ mod tests {
             .await
             .expect("body should be readable");
         let body_text = String::from_utf8(body.to_vec()).expect("body should be utf8");
-        assert!(body_text.contains("event: content_block_delta"));
-        assert!(body_text.contains("STREAM_OK"));
-        assert!(body_text.contains("event: message_stop"));
+        let events = parse_sse_events(&body_text);
+        let event_names: Vec<&str> = events.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(
+            event_names,
+            vec![
+                "message_start",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_stop",
+                "message_delta",
+                "message_stop"
+            ]
+        );
+        assert_eq!(
+            events[2]
+                .1
+                .get("delta")
+                .and_then(|v| v.get("text"))
+                .and_then(Value::as_str),
+            Some("STREAM_OK")
+        );
+        let message_start_data = &events[0].1;
+        let message_obj = message_start_data
+            .get("message")
+            .expect("message_start must contain message object");
+        assert_eq!(
+            message_obj.get("type").and_then(Value::as_str),
+            Some("message"),
+            "message.type must be 'message'"
+        );
+        assert_eq!(
+            message_obj.get("role").and_then(Value::as_str),
+            Some("assistant"),
+            "message.role must be 'assistant'"
+        );
+        assert!(
+            message_obj
+                .get("id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| id.starts_with("msg_")),
+            "message.id must start with msg_ prefix"
+        );
+        assert!(
+            message_obj.get("model").is_some_and(Value::is_string),
+            "message.model must be present"
+        );
+        assert_eq!(
+            events[4]
+                .1
+                .get("delta")
+                .and_then(|v| v.get("stop_reason"))
+                .and_then(Value::as_str),
+            Some("end_turn")
+        );
+    }
+
+    #[tokio::test]
+    async fn messages_stream_malformed_chunk_returns_error_event_with_request_correlation() {
+        let (base_url, _server) = spawn_mock_openai_malformed_stream_server().await;
+        let app = build_router(test_state_with_base_url(base_url));
+        let payload = r#"{"model":"claude-sonnet-4","stream":true,"messages":[{"role":"user","content":"Hello"}]}"#;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("content-type", "application/json")
+                    .header("x-api-key", "dummy")
+                    .body(Body::from(payload))
+                    .expect("request build should succeed"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let request_id_header = response
+            .headers()
+            .get("x-request-id")
+            .and_then(|v| v.to_str().ok())
+            .expect("x-request-id should be present")
+            .to_string();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should be readable");
+        let body_text = String::from_utf8(body.to_vec()).expect("body should be utf8");
+        let events = parse_sse_events(&body_text);
+        let event_names: Vec<&str> = events.iter().map(|(name, _)| name.as_str()).collect();
+
+        assert_eq!(
+            event_names,
+            vec![
+                "message_start",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_stop",
+                "error"
+            ]
+        );
+        let error_payload = events
+            .last()
+            .expect("error event must exist")
+            .1
+            .get("error")
+            .cloned()
+            .expect("error body must exist");
+        assert_eq!(
+            error_payload.get("source").and_then(Value::as_str),
+            Some("upstream")
+        );
+        assert_eq!(
+            error_payload.get("request_id").and_then(Value::as_str),
+            Some(request_id_header.as_str())
+        );
+        assert!(
+            !event_names.contains(&"message_stop"),
+            "terminal success event must not be emitted on stream parse failure"
+        );
     }
 
     #[tokio::test]
@@ -1442,6 +1665,124 @@ mod tests {
         assert!(body_text.contains("\"source\":\"local_auth\""));
     }
 
+    #[tokio::test]
+    async fn messages_stream_upstream_unreachable_emits_error_event() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener bind should succeed");
+        let addr = listener
+            .local_addr()
+            .expect("listener should have a local address");
+        drop(listener);
+        let app = build_router(test_state_with_base_url(format!("http://{}", addr)));
+        let payload = r#"{"model":"claude-sonnet-4","stream":true,"messages":[{"role":"user","content":"Hello"}]}"#;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("content-type", "application/json")
+                    .header("x-api-key", "dummy")
+                    .body(Body::from(payload))
+                    .expect("request build should succeed"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("text/event-stream")
+        );
+        let request_id_header = response
+            .headers()
+            .get("x-request-id")
+            .and_then(|v| v.to_str().ok())
+            .expect("x-request-id should be present")
+            .to_string();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should be readable");
+        let body_text = String::from_utf8(body.to_vec()).expect("body should be utf8");
+        let events = parse_sse_events(&body_text);
+        let event_names: Vec<&str> = events.iter().map(|(name, _)| name.as_str()).collect();
+
+        assert_eq!(event_names, vec!["error"]);
+        let error_payload = events[0]
+            .1
+            .get("error")
+            .cloned()
+            .expect("error body must exist");
+        assert_eq!(
+            error_payload.get("source").and_then(Value::as_str),
+            Some("upstream")
+        );
+        assert_eq!(
+            error_payload.get("request_id").and_then(Value::as_str),
+            Some(request_id_header.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn messages_stream_upstream_http_failure_emits_error_event() {
+        let (base_url, _server) = spawn_mock_openai_error_server().await;
+        let app = build_router(test_state_with_base_url(base_url));
+        let payload = r#"{"model":"claude-sonnet-4","stream":true,"messages":[{"role":"user","content":"Hello"}]}"#;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("content-type", "application/json")
+                    .header("x-api-key", "dummy")
+                    .body(Body::from(payload))
+                    .expect("request build should succeed"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("text/event-stream")
+        );
+        let request_id_header = response
+            .headers()
+            .get("x-request-id")
+            .and_then(|v| v.to_str().ok())
+            .expect("x-request-id should be present")
+            .to_string();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should be readable");
+        let body_text = String::from_utf8(body.to_vec()).expect("body should be utf8");
+        let events = parse_sse_events(&body_text);
+        let event_names: Vec<&str> = events.iter().map(|(name, _)| name.as_str()).collect();
+
+        assert_eq!(event_names, vec!["error"]);
+        let error_payload = events[0]
+            .1
+            .get("error")
+            .cloned()
+            .expect("error body must exist");
+        assert_eq!(
+            error_payload.get("source").and_then(Value::as_str),
+            Some("upstream")
+        );
+        assert_eq!(
+            error_payload.get("request_id").and_then(Value::as_str),
+            Some(request_id_header.as_str())
+        );
+    }
+
     async fn spawn_mock_openai_server() -> (String, tokio::task::JoinHandle<()>) {
         async fn chat_completions_handler() -> (StatusCode, Json<serde_json::Value>) {
             let response = json!({
@@ -1529,8 +1870,42 @@ mod tests {
             let payload = concat!(
                 "data: {\"id\":\"chatcmpl-stream\",\"model\":\"openai-test-model\",",
                 "\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",",
-                "\"content\":\"STREAM_OK\"},\"finish_reason\":null}]}\n\n",
+                "\"content\":\"STREAM_OK\"},\"finish_reason\":\"stop\"}]}\n\n",
                 "data: [DONE]\n\n"
+            );
+            HttpResponse::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "text/event-stream")
+                .body(Body::from(payload))
+                .expect("response build should succeed")
+        }
+
+        let app = Router::new().route("/chat/completions", post(chat_completions_stream_handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener bind should succeed");
+        let addr = listener
+            .local_addr()
+            .expect("listener should have a local address");
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        (format!("http://{}", addr), handle)
+    }
+
+    async fn spawn_mock_openai_malformed_stream_server() -> (String, tokio::task::JoinHandle<()>) {
+        async fn chat_completions_stream_handler(Json(body): Json<Value>) -> HttpResponse<Body> {
+            assert_eq!(
+                body.get("stream").and_then(Value::as_bool),
+                Some(true),
+                "upstream request must contain stream: true"
+            );
+            let payload = concat!(
+                "data: {\"id\":\"chatcmpl-stream\",\"model\":\"openai-test-model\",",
+                "\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",",
+                "\"content\":\"STREAM_OK\"},\"finish_reason\":null}]}\n\n",
+                "data: {bad-json}\n\n"
             );
             HttpResponse::builder()
                 .status(StatusCode::OK)
@@ -1558,6 +1933,28 @@ mod tests {
             .await
             .expect("body should be readable");
         serde_json::from_slice::<Value>(&body).expect("body should be valid json")
+    }
+
+    fn parse_sse_events(body_text: &str) -> Vec<(String, Value)> {
+        body_text
+            .split("\n\n")
+            .filter_map(|frame| {
+                let trimmed = frame.trim();
+                if trimmed.is_empty() {
+                    return None;
+                }
+                let mut event_name: Option<String> = None;
+                let mut data_payload: Option<Value> = None;
+                for line in trimmed.lines() {
+                    if let Some(name) = line.strip_prefix("event: ") {
+                        event_name = Some(name.to_string());
+                    } else if let Some(data) = line.strip_prefix("data: ") {
+                        data_payload = serde_json::from_str::<Value>(data).ok();
+                    }
+                }
+                Some((event_name?, data_payload?))
+            })
+            .collect()
     }
 
     fn test_state() -> AppState {
