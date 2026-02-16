@@ -373,6 +373,7 @@ mod tests {
             model_haiku: "mapped-haiku".to_string(),
             model_sonnet: "mapped-sonnet".to_string(),
             model_opus: "mapped-opus".to_string(),
+            route_policy: None,
         }
     }
 

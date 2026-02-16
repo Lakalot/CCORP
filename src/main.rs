@@ -10,6 +10,7 @@ mod openrouter;
 mod stream;
 mod switch_model;
 
+use application::routing_policy;
 use axum::{
     Extension, Router,
     body::Body,
@@ -177,7 +178,27 @@ async fn messages_handler(
     let is_stream = resolve_stream_mode(payload.stream);
 
     let settings_guard = state.config.read().await;
-    let openai_request =
+    let mapped_request_model = anthropic_to_openai::map_model(&payload.model, &settings_guard);
+    let active_route =
+        match routing_policy::resolve_primary_route(&settings_guard, &mapped_request_model) {
+            Ok(route) => route,
+            Err(error) => {
+                tracing::warn!(
+                    request_id = %request_id.0,
+                    error = %error,
+                    "route policy validation failed"
+                );
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    ErrorSource::LocalValidation,
+                    format!("Invalid route policy: {}", error.message()),
+                    request_id.0,
+                )
+                .into_response();
+            }
+        };
+
+    let mut openai_request =
         match anthropic_to_openai::format_anthropic_to_openai(payload, &settings_guard) {
             Ok(request) => request,
             Err(error) => {
@@ -190,6 +211,7 @@ async fn messages_handler(
                 .into_response();
             }
         };
+    openai_request.model = active_route.model.clone();
 
     if let Ok(request_json) = serde_json::to_string_pretty(&openai_request) {
         log_payload(&state.logging_path, "request", &request_json);
@@ -202,7 +224,7 @@ async fn messages_handler(
     tracing::info!(
         request_id = %request_id.0,
         route = "/v1/messages",
-        provider = "openrouter",
+        provider = %active_route.provider,
         model = %openai_request.model,
         "dispatching request upstream"
     );
@@ -2612,6 +2634,48 @@ mod tests {
         (format!("http://{}", addr), MockServer(handle))
     }
 
+    async fn spawn_mock_openai_echo_server() -> (String, MockServer) {
+        async fn chat_completions_echo_handler(
+            Json(body): Json<Value>,
+        ) -> (StatusCode, Json<Value>) {
+            let requested_model = body
+                .get("model")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown-model");
+            let response = json!({
+                "id": "chatcmpl-echo",
+                "model": requested_model,
+                "choices": [{
+                    "index": 0,
+                    "finish_reason": "stop",
+                    "message": {
+                        "role": "assistant",
+                        "content": "ok"
+                    }
+                }],
+                "usage": {
+                    "prompt_tokens": 1,
+                    "completion_tokens": 1,
+                    "total_tokens": 2
+                }
+            });
+            (StatusCode::OK, Json(response))
+        }
+
+        let app = Router::new().route("/chat/completions", post(chat_completions_echo_handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener bind should succeed");
+        let addr = listener
+            .local_addr()
+            .expect("listener should have a local address");
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        (format!("http://{}", addr), MockServer(handle))
+    }
+
     async fn parse_json_body(response: Response) -> Value {
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
@@ -2790,11 +2854,113 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn messages_rejects_invalid_route_policy_with_canonical_error() {
+        let app = build_router(test_state_with_route_policy(Some(
+            crate::domain::route_policy::RoutePolicyConfig {
+                routes: vec![
+                    crate::domain::route_policy::RouteTargetConfig {
+                        provider: "openrouter".to_string(),
+                        model: "sonnet".to_string(),
+                        priority: 1,
+                    },
+                    crate::domain::route_policy::RouteTargetConfig {
+                        provider: "openrouter".to_string(),
+                        model: "haiku".to_string(),
+                        priority: 1,
+                    },
+                ],
+            },
+        )));
+        let payload =
+            r#"{"model":"claude-sonnet-4","messages":[{"role":"user","content":"Hello"}]}"#;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("content-type", "application/json")
+                    .header("x-api-key", "dummy")
+                    .body(Body::from(payload))
+                    .expect("request build should succeed"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = parse_json_body(response).await;
+        assert_eq!(body["type"], "error");
+        assert_eq!(body["error"]["source"], "local_validation");
+        assert!(body["error"]["request_id"].is_string());
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("Invalid route policy"))
+        );
+    }
+
+    #[tokio::test]
+    async fn messages_with_valid_route_policy_selects_primary_deterministically() {
+        let (base_url, _server) = spawn_mock_openai_echo_server().await;
+        let app = build_router(test_state_with_base_url_and_route_policy(
+            base_url,
+            Some(crate::domain::route_policy::RoutePolicyConfig {
+                routes: vec![
+                    crate::domain::route_policy::RouteTargetConfig {
+                        provider: "openrouter".to_string(),
+                        model: "haiku".to_string(),
+                        priority: 2,
+                    },
+                    crate::domain::route_policy::RouteTargetConfig {
+                        provider: "openrouter".to_string(),
+                        model: "sonnet".to_string(),
+                        priority: 1,
+                    },
+                ],
+            }),
+        ));
+        let payload = r#"{"model":"claude-opus-4","messages":[{"role":"user","content":"Hello"}]}"#;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("content-type", "application/json")
+                    .header("x-api-key", "dummy")
+                    .body(Body::from(payload))
+                    .expect("request build should succeed"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = parse_json_body(response).await;
+        assert_eq!(body["model"], "sonnet");
+    }
+
     fn test_state() -> AppState {
         test_state_with_base_url("https://openrouter.ai/api/v1".to_string())
     }
 
     fn test_state_with_base_url(base_url: String) -> AppState {
+        test_state_with_base_url_and_route_policy(base_url, None)
+    }
+
+    fn test_state_with_route_policy(
+        route_policy: Option<crate::domain::route_policy::RoutePolicyConfig>,
+    ) -> AppState {
+        test_state_with_base_url_and_route_policy(
+            "https://openrouter.ai/api/v1".to_string(),
+            route_policy,
+        )
+    }
+
+    fn test_state_with_base_url_and_route_policy(
+        base_url: String,
+        route_policy: Option<crate::domain::route_policy::RoutePolicyConfig>,
+    ) -> AppState {
         let config = Config {
             port: 3332,
             base_url,
@@ -2803,6 +2969,7 @@ mod tests {
             model_haiku: "haiku".to_string(),
             model_sonnet: "sonnet".to_string(),
             model_opus: "opus".to_string(),
+            route_policy,
         };
         AppState {
             config: Arc::new(RwLock::new(config)),
@@ -2821,6 +2988,7 @@ mod tests {
             model_haiku: "haiku".to_string(),
             model_sonnet: "sonnet".to_string(),
             model_opus: "opus".to_string(),
+            route_policy: None,
         };
         let client = Client::builder()
             .read_timeout(timeout)

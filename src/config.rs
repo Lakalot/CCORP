@@ -5,11 +5,16 @@ use std::env;
 use std::fmt;
 use std::fs;
 
+use crate::domain::route_policy::{RoutePolicyConfig, validate_and_sort_routes};
+use std::collections::HashSet;
+
 /// TOML configuration structure
 #[derive(Deserialize, Serialize)]
 struct JsonConfig {
     port: u16,
     models: ModelConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    route_policy: Option<RoutePolicyConfig>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -36,9 +41,25 @@ pub struct Config {
     pub model_sonnet: String,
     /// Override model name for Claude Opus 4
     pub model_opus: String,
+    /// Optional deterministic route policy for upstream model/provider selection.
+    pub route_policy: Option<RoutePolicyConfig>,
 }
 
 impl Config {
+    /// Known upstream providers for route policy validation.
+    pub fn known_providers(&self) -> HashSet<String> {
+        HashSet::from(["openrouter".to_string()])
+    }
+
+    /// Known model aliases for route policy validation.
+    pub fn known_models(&self) -> HashSet<String> {
+        HashSet::from([
+            self.model_haiku.clone(),
+            self.model_sonnet.clone(),
+            self.model_opus.clone(),
+        ])
+    }
+
     /// Load configuration from `config.json` and `.env` file.
     pub fn from_env() -> Self {
         Self::try_from_env().unwrap_or_else(|err| panic!("Configuration error: {err}"))
@@ -73,7 +94,7 @@ impl Config {
         let config: JsonConfig =
             serde_json::from_str(config_contents).map_err(|_| ConfigError::ConfigParse)?;
 
-        Ok(Config {
+        let result = Config {
             port: config.port,
             base_url: default_openrouter_base_url(),
             api_key,
@@ -81,7 +102,15 @@ impl Config {
             model_haiku: config.models.haiku,
             model_sonnet: config.models.sonnet,
             model_opus: config.models.opus,
-        })
+            route_policy: config.route_policy,
+        };
+
+        if let Some(ref policy) = result.route_policy {
+            validate_and_sort_routes(policy, &result.known_providers(), &result.known_models())
+                .map_err(|e| ConfigError::InvalidRoutePolicy(e.message().to_string()))?;
+        }
+
+        Ok(result)
     }
 
     /// Write configuration to `config.json` (excluding secrets like api_key).
@@ -94,6 +123,7 @@ impl Config {
                 sonnet: self.model_sonnet.clone(),
                 opus: self.model_opus.clone(),
             },
+            route_policy: self.route_policy.clone(),
         };
 
         let json_string =
@@ -117,6 +147,7 @@ pub enum ConfigError {
     ConfigParse,
     ConfigSerialize,
     ConfigFileWrite,
+    InvalidRoutePolicy(String),
 }
 
 impl fmt::Display for ConfigError {
@@ -131,6 +162,9 @@ impl fmt::Display for ConfigError {
                 write!(f, "Could not serialize configuration")
             }
             ConfigError::ConfigFileWrite => write!(f, "Could not write config.json file"),
+            ConfigError::InvalidRoutePolicy(msg) => {
+                write!(f, "Invalid route policy: {msg}")
+            }
         }
     }
 }
@@ -185,6 +219,15 @@ mod tests {
             error.to_string().contains("OPENROUTER_API_KEY"),
             "diagnostic should explain which environment variable is required"
         );
+    }
+
+    #[test]
+    fn rejects_invalid_route_policy_at_load_time() {
+        let config = r#"{"port":3000,"models":{"haiku":"h","sonnet":"s","opus":"o"},"route_policy":{"routes":[{"provider":"openrouter","model":"s","priority":1},{"provider":"openrouter","model":"h","priority":1}]}}"#;
+        let error = Config::try_from_sources(Some("secret".to_string()), None, config)
+            .expect_err("invalid route policy should fail at load time");
+        assert!(matches!(error, ConfigError::InvalidRoutePolicy(_)));
+        assert!(error.to_string().contains("Duplicate priority"));
     }
 
     #[test]
